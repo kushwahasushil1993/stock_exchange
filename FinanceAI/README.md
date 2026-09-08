@@ -122,7 +122,7 @@
 ## ✅ Prerequisites
 
 ### Local Development
-- Python **3.11+**
+- Python **3.12+**
 - PostgreSQL **14+**
 - Redis **6+**
 - Git
@@ -427,7 +427,7 @@ sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y \
     git curl wget unzip \
     build-essential libpq-dev \
-    python3.11 python3.11-venv python3-pip \
+    python3.12 python3.12-venv python3-pip \
     nginx certbot python3-certbot-nginx \
     ufw
 
