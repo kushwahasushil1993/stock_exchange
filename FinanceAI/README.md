@@ -792,6 +792,15 @@ Market Opens (9:15 AM IST)
 
 ### Setup Airflow Locally
 
+Airflow pins `SQLAlchemy < 2.0` and conflicts with the app's `sqlalchemy==2.0.30`,
+so install it in its **own** virtualenv (not the app venv):
+
+```bash
+python3.12 -m venv airflow-venv
+source airflow-venv/bin/activate
+pip install -r requirements-airflow.txt
+```
+
 ```bash
 # Set Airflow home directory
 export AIRFLOW_HOME=/opt/financeai/airflow

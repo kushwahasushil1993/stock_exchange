@@ -5,10 +5,15 @@ Apache Airflow DAGs:
   3. daily_prediction_pipeline    — run predictions for all watchlist symbols
   4. mf_data_refresh              — refresh MF NAVs daily
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
+
+import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+
+# Static start_date (Airflow best practice; replaces the removed
+# airflow.utils.dates.days_ago helper).
+START_DATE = pendulum.datetime(2024, 1, 1, tz="UTC")
 
 DEFAULT_ARGS = {
     "owner":            "financeai",
@@ -71,7 +76,7 @@ with DAG(
     dag_id      = "daily_market_data_ingestion",
     description = "Fetch OHLCV, news, and macro data",
     schedule    = "30 9 * * 1-5",   # 9:30 AM IST weekdays (4:00 UTC)
-    start_date  = days_ago(1),
+    start_date  = START_DATE,
     default_args= DEFAULT_ARGS,
     catchup     = False,
     tags        = ["ingestion", "market-data"],
@@ -176,7 +181,7 @@ with DAG(
     dag_id       = "daily_prediction_pipeline",
     description  = "Run ML ensemble predictions for all watchlist stocks",
     schedule     = "0 10 * * 1-5",   # 10 AM IST weekdays
-    start_date   = days_ago(1),
+    start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
     catchup      = False,
     tags         = ["predictions", "ml"],
@@ -239,7 +244,7 @@ with DAG(
     dag_id       = "weekly_model_retraining",
     description  = "Retrain all ML models on fresh data",
     schedule     = "0 2 * * 0",   # Sunday 2 AM UTC
-    start_date   = days_ago(7),
+    start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
     catchup      = False,
     tags         = ["training", "ml"],
