@@ -40,7 +40,9 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.9
 
 # ─── Orchestration ──────────────────────────────────────────────────────────
-apache-airflow==2.10.0
+# Airflow is deployed as its own container (docker/docker-compose.yml) and pins
+# SQLAlchemy < 2.0, which conflicts with sqlalchemy==2.0.30 above. Install it in
+# a separate environment: pip install -r requirements-airflow.txt
 
 # ─── Monitoring ─────────────────────────────────────────────────────────────
 prometheus-fastapi-instrumentator==7.0.0

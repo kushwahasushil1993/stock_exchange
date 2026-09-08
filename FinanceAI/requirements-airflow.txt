@@ -1,0 +1,9 @@
+# ─── Orchestration (separate environment) ──────────────────────────────────
+# Apache Airflow pins SQLAlchemy < 2.0 and conflicts with the app's
+# sqlalchemy==2.0.30, so it must be installed in its own virtualenv /
+# AIRFLOW_HOME (or run via the apache/airflow container in docker-compose.yml).
+#
+#   python3.12 -m venv airflow-venv
+#   airflow-venv/bin/pip install -r requirements-airflow.txt
+#
+apache-airflow==2.10.0
