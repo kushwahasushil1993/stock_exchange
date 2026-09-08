@@ -158,6 +158,10 @@ pip install --upgrade pip
 
 # Install all dependencies
 pip install -r requirements.txt
+
+# Install the project itself (editable) so `src` and `config` import
+# from any working directory / from your IDE
+pip install -e .
 ```
 
 > ⚠️ **Note on TensorFlow**: If you're on Apple Silicon (M1/M2), replace `tensorflow` with `tensorflow-macos` in `requirements.txt` before installing.
