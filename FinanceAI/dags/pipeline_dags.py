@@ -8,8 +8,13 @@ Apache Airflow DAGs:
 from datetime import timedelta
 
 import pendulum
-from airflow import DAG
-from airflow.operators.python import PythonOperator
+
+try:  # Airflow 3.x
+    from airflow.sdk import DAG
+    from airflow.providers.standard.operators.python import PythonOperator
+except ImportError:  # Airflow 2.x
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
 
 # Static start_date (Airflow best practice; replaces the removed
 # airflow.utils.dates.days_ago helper).
@@ -20,8 +25,9 @@ DEFAULT_ARGS = {
     "depends_on_past":  False,
     "retries":          2,
     "retry_delay":      timedelta(minutes=5),
-    "email_on_failure": True,
-    "email":            ["alerts@financeai.io"],
+    # Task-level `email` / `email_on_failure` are deprecated (removed in
+    # Airflow 4). For failure alerts, attach an on_failure_callback, e.g.
+    # airflow.providers.smtp.notifications.smtp.SmtpNotifier.
 }
 
 
