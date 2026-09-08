@@ -1,0 +1,168 @@
+version: "3.9"
+
+services:
+
+  # ─── Application ─────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: financeai-api
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_URL=postgresql+asyncpg://finai:finai@postgres:5432/financeai
+      - REDIS_URL=redis://redis:6379/0
+      - INFLUX_URL=http://influxdb:8086
+      - ENVIRONMENT=production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../models_store:/app/models_store
+      - ../data:/app/data
+      - ../logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - financeai-net
+
+  # ─── Databases ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: financeai-postgres
+    environment:
+      POSTGRES_USER:     finai
+      POSTGRES_PASSWORD: finai
+      POSTGRES_DB:       financeai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - financeai-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: financeai-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - financeai-net
+
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: financeai-influx
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE:        setup
+      DOCKER_INFLUXDB_INIT_USERNAME:    admin
+      DOCKER_INFLUXDB_INIT_PASSWORD:    adminadmin
+      DOCKER_INFLUXDB_INIT_ORG:         financeai
+      DOCKER_INFLUXDB_INIT_BUCKET:      market_data
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: my-super-secret-token
+    volumes:
+      - influx_data:/var/lib/influxdb2
+    networks:
+      - financeai-net
+
+  # ─── Airflow ─────────────────────────────────────────────────────────────
+  airflow-webserver:
+    image: apache/airflow:2.9.0
+    container_name: financeai-airflow
+    command: webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR:               LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:   postgresql+psycopg2://finai:finai@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES:          "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY:        financeai-airflow-secret
+      PYTHONPATH:                            /app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../src:/app/src
+      - ../config:/app/config
+      - ../models_store:/app/models_store
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      - postgres
+    networks:
+      - financeai-net
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.0
+    container_name: financeai-scheduler
+    command: scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR:               LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:   postgresql+psycopg2://finai:finai@postgres:5432/airflow
+      PYTHONPATH:                            /app
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../src:/app/src
+      - ../config:/app/config
+      - ../models_store:/app/models_store
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      - postgres
+    networks:
+      - financeai-net
+
+  # ─── Monitoring ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: financeai-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - financeai-net
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: financeai-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../monitoring/grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - financeai-net
+
+volumes:
+  postgres_data:
+  redis_data:
+  influx_data:
+  airflow_logs:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  financeai-net:
+    driver: bridge
