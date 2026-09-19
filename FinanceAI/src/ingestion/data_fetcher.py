@@ -119,7 +119,17 @@ class NSEFetcher:
     }
 
     async def _get_session_cookie(self, session: aiohttp.ClientSession) -> str:
-        """Obtain NSE session cookie required for API calls."""
+        """
+        Obtain the NSE session cookie required for API calls.
+
+        Uses NSE_COOKIE from settings if configured (a cookie captured from a
+        real browser session on nseindia.com — Akamai's bot manager otherwise
+        blocks plain server-to-server requests). It expires within hours, so
+        this is a stopgap; falls back to a fresh dynamic fetch when unset or
+        once NSE stops honoring it.
+        """
+        if settings.nse_cookie:
+            return settings.nse_cookie
         async with session.get(self.BASE_URL, headers=self.HEADERS) as resp:
             cookies = {k: v.value for k, v in resp.cookies.items()}
             return "; ".join([f"{k}={v}" for k, v in cookies.items()])
