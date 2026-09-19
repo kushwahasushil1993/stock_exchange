@@ -12,7 +12,8 @@ import uvicorn
 
 from config.settings import settings
 from src.database.models import init_db, redis_cache
-from src.api.routers import stocks, fno, mutual_funds, predictions, auth, health, payments
+from src.api.routers import stocks, fno, mutual_funds, predictions, auth, health
+# from src.api.routers import payments  # Razorpay integration — disabled until needed
 from src.api.middleware.rate_limit import RateLimitMiddleware
 from src.api.middleware.logging_mw import RequestLoggingMiddleware
 
@@ -70,7 +71,7 @@ app.include_router(auth.router,         prefix="/api/v1/auth",         tags=["Au
 app.include_router(health.router,       prefix="/api/v1",              tags=["Health"])
 app.include_router(stocks.router,       prefix="/api/v1/stocks",       tags=["Stocks"])
 app.include_router(predictions.router,  prefix="/api/v1/predictions",  tags=["Predictions"])
-app.include_router(payments.router,     prefix="/api/v1/payments",     tags=["Payments"])
+# app.include_router(payments.router,     prefix="/api/v1/payments",     tags=["Payments"])  # Razorpay integration — disabled until needed
 app.include_router(fno.router,          prefix="/api/v1/fno",          tags=["FNO"])
 app.include_router(mutual_funds.router, prefix="/api/v1/mutual-funds", tags=["Mutual Funds"])
 
