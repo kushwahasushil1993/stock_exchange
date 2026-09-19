@@ -37,6 +37,7 @@ vaderSentiment==3.3.2
 # ─── Auth & Security ────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+bcrypt==3.2.2               # passlib 1.7.4 predates bcrypt>=4's breaking change (raises on unpinned >=4.x)
 python-multipart==0.0.9
 
 # ─── Orchestration ──────────────────────────────────────────────────────────

@@ -44,19 +44,39 @@ async def mf_recommendations(
     import asyncio
 
     fetcher = AMFIFetcher()
-    nav_df  = asyncio.run(fetcher.fetch_all_navs())
+    nav_df  = await fetcher.fetch_all_navs()
 
     if nav_df.empty:
         return []
 
-    # Enrich with computed returns (sample top 200 Open-Ended funds)
-    open_ended = nav_df[nav_df["category"].str.contains("Open Ended", na=False)].head(200)
-    enriched_rows = []
+    # Filter to open-ended schemes in categories relevant to the requested
+    # risk profile *before* sampling. AMFI's file is ordered alphabetically by
+    # category, so a plain .head(200) over the unfiltered universe can easily
+    # sample 200 schemes with zero matches for whatever profile was asked for
+    # (e.g. MODERATE wants Equity/Hybrid categories, which sort well after
+    # "Children's Fund"/"Debt Scheme..." alphabetically).
+    profile_categories = MutualFundRecommender()._get_profile_categories(RiskProfile(risk_profile))
+    relevant = nav_df[
+        nav_df["category"].str.contains("Open Ended", na=False)
+        & nav_df["category"].apply(lambda c: any(pc.lower() in str(c).lower() for pc in profile_categories))
+    ]
+    if category:
+        relevant = relevant[relevant["category"].str.contains(category, case=False, na=False)]
 
-    for _, row in open_ended.iterrows():
-        hist = asyncio.run(fetcher.fetch_historical_nav(str(row["scheme_code"])))
-        returns = fetcher.compute_returns(hist)
-        enriched_rows.append({**row.to_dict(), **returns})
+    # Enrich with computed returns (sample up to 200 matching funds).
+    # Bounded concurrency: 200 sequential requests to mfapi.in would take
+    # minutes; a plain asyncio.gather with no cap would fire all 200 at once.
+    open_ended = relevant.head(200)
+    sem = asyncio.Semaphore(20)
+
+    async def _fetch_with_returns(row):
+        async with sem:
+            hist = await fetcher.fetch_historical_nav(str(row["scheme_code"]))
+        return {**row.to_dict(), **fetcher.compute_returns(hist)}
+
+    enriched_rows = await asyncio.gather(*(
+        _fetch_with_returns(row) for _, row in open_ended.iterrows()
+    ))
 
     import pandas as pd
     enriched_df = pd.DataFrame(enriched_rows)
