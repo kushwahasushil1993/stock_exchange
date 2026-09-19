@@ -30,13 +30,19 @@ async def run():
 
     ohlcv_data = {}
     fund_data  = {}
-    for sym in symbols:
+    for i, sym in enumerate(symbols):
         print(f"  Fetching {sym}…", end=" ")
-        ohlcv = yf.fetch_ohlcv(sym, period="2y")
-        fund  = yf.fetch_fundamentals(sym)
+        try:
+            ohlcv = yf.fetch_ohlcv(sym, period="2y")
+            fund  = yf.fetch_fundamentals(sym)
+            print(f"✓ {len(ohlcv)} rows")
+        except Exception as exc:
+            print(f"⚠️  failed: {exc}")
+            ohlcv, fund = pd.DataFrame(), {}
         ohlcv_data[sym] = ohlcv
         fund_data[sym]  = fund
-        print(f"✓ {len(ohlcv)} rows")
+        if i < len(symbols) - 1:
+            await asyncio.sleep(1)  # avoid tripping Yahoo Finance's rate limit
 
     # ── 2. News Sentiment ────────────────────────────────────────────────
     print("\n📰 Step 2: Fetching & analyzing news sentiment…")

@@ -64,8 +64,15 @@ class YFinanceFetcher:
         return result
 
     def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info or {}
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info or {}
+        except Exception as exc:
+            # Yahoo rate-limits (HTTP 429) aggressively and yfinance sometimes
+            # surfaces that as a raw JSONDecodeError instead of a clean error —
+            # degrade gracefully instead of crashing the caller.
+            logger.warning("Failed to fetch fundamentals for %s: %s", symbol, exc)
+            info = {}
         return {
             "pe_ratio": info.get("trailingPE"),
             "pb_ratio": info.get("priceToBook"),
