@@ -36,8 +36,8 @@ class FundamentalsOut(BaseModel):
 @router.get("/{symbol}/ohlcv")
 async def get_ohlcv(
     symbol:   str,
-    period:   str = Query(default="1y", regex="^(1mo|3mo|6mo|1y|2y|5y)$"),
-    interval: str = Query(default="1d", regex="^(1d|1wk|1mo)$"),
+    period:   str = Query(default="1y", pattern="^(1mo|3mo|6mo|1y|2y|5y)$"),
+    interval: str = Query(default="1d", pattern="^(1d|1wk|1mo)$"),
     _user:    User = Depends(get_current_user),
 ):
     cache_key = f"ohlcv:{symbol}:{period}:{interval}"

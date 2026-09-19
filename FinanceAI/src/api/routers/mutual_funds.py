@@ -29,7 +29,7 @@ class MFOut(BaseModel):
 async def mf_recommendations(
     risk_profile: str = Query(
         default="MODERATE",
-        regex="^(CONSERVATIVE|MODERATE|AGGRESSIVE)$",
+        pattern="^(CONSERVATIVE|MODERATE|AGGRESSIVE)$",
     ),
     category:  Optional[str] = Query(default=None),
     top_n:     int = Query(default=5, ge=1, le=20),

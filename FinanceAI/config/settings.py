@@ -2,7 +2,7 @@
 Central configuration management using pydantic-settings.
 All secrets loaded from environment variables / .env file.
 """
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import List, Optional
 from functools import lru_cache
@@ -16,9 +16,7 @@ class DatabaseSettings(BaseSettings):
     influx_org: str = Field(default="financeai")
     influx_bucket: str = Field(default="market_data")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 class APIKeys(BaseSettings):
@@ -31,9 +29,7 @@ class APIKeys(BaseSettings):
     razorpay_key_secret: str = Field(default="")
     razorpay_webhook_secret: str = Field(default="")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 class ModelSettings(BaseSettings):
@@ -44,9 +40,13 @@ class ModelSettings(BaseSettings):
     prediction_confidence_threshold: float = Field(default=0.65)
     min_training_samples: int = Field(default=500)
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    # `model_store_path` collides with pydantic's protected "model_" namespace
+    # (used for methods like model_dump); silence the warning explicitly.
+    model_config = SettingsConfigDict(
+        protected_namespaces=("settings_",),
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
 class AppSettings(BaseSettings):
@@ -83,15 +83,15 @@ class AppSettings(BaseSettings):
         "ELSS", "Index Fund", "Sectoral/Thematic"
     ])
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 class Settings(AppSettings, DatabaseSettings, APIKeys, ModelSettings):
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        protected_namespaces=("settings_",),
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
 @lru_cache()
