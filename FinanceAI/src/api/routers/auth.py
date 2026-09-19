@@ -61,28 +61,44 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, settings.secret_key, algorithm=settings.jwt_algorithm)
 
 
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(get_db),
-) -> User:
-    credentials_exc = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid authentication credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+# ─── Authorization — DISABLED FOR NOW ───────────────────────────────────────
+# Bypasses JWT/DB validation entirely so every Depends(get_current_user) call
+# site (20 of them, across stocks/fno/mutual_funds/predictions/payments)
+# works unauthenticated. The real implementation is commented out below, not
+# deleted — swap this back to re-enable auth.
+async def get_current_user() -> User:
+    return User(
+        id=0,
+        email="dev@local",
+        hashed_password="",
+        full_name="Dev (auth disabled)",
+        risk_profile="MODERATE",
+        is_active=True,
     )
-    try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exc
-    except JWTError:
-        raise credentials_exc
 
-    result = await db.execute(select(User).where(User.email == email))
-    user = result.scalar_one_or_none()
-    if user is None or not user.is_active:
-        raise credentials_exc
-    return user
+
+# async def get_current_user(
+#     token: str = Depends(oauth2_scheme),
+#     db: AsyncSession = Depends(get_db),
+# ) -> User:
+#     credentials_exc = HTTPException(
+#         status_code=status.HTTP_401_UNAUTHORIZED,
+#         detail="Invalid authentication credentials",
+#         headers={"WWW-Authenticate": "Bearer"},
+#     )
+#     try:
+#         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+#         email: str = payload.get("sub")
+#         if email is None:
+#             raise credentials_exc
+#     except JWTError:
+#         raise credentials_exc
+#
+#     result = await db.execute(select(User).where(User.email == email))
+#     user = result.scalar_one_or_none()
+#     if user is None or not user.is_active:
+#         raise credentials_exc
+#     return user
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────────
