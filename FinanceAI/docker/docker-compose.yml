@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
 
   # ─── Application ─────────────────────────────────────────────────────────
@@ -11,8 +9,11 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ../.env   # SECRET_KEY, NEWSAPI_KEY, RAZORPAY_*, etc. — the 4 vars
-                  # below override it with compose-internal service hostnames
+      - ../.env.docker   # like .env (SECRET_KEY, NEWSAPI_KEY, RAZORPAY_*, ...) but
+                         # without NSE_COOKIE — Compose's env_file parser expands
+                         # $VAR in values, which mangles that cookie's embedded `$`
+                         # (python-dotenv, used for local runs, doesn't do this).
+                         # The 4 vars below override it with compose-internal hostnames.
     environment:
       - POSTGRES_URL=postgresql+asyncpg://finai:finai@postgres:5432/financeai
       - REDIS_URL=redis://redis:6379/0
@@ -40,9 +41,10 @@ services:
       POSTGRES_PASSWORD: finai
       POSTGRES_DB:       financeai
     ports:
-      - "5432:5432"
+      - "5434:5432"   # host 5432 already taken by an unrelated container on this machine
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init-airflow-db.sql:/docker-entrypoint-initdb.d/init-airflow-db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U finai"]
       interval: 10s
@@ -56,7 +58,7 @@ services:
     container_name: financeai-redis
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     ports:
-      - "6379:6379"
+      - "6381:6379"   # host 6379 already taken by an unrelated container on this machine
     volumes:
       - redis_data:/data
     healthcheck:
@@ -71,7 +73,7 @@ services:
     image: influxdb:2.7-alpine
     container_name: financeai-influx
     ports:
-      - "8086:8086"
+      - "8087:8086"   # host 8086 already taken by an unrelated container on this machine
     environment:
       DOCKER_INFLUXDB_INIT_MODE:        setup
       DOCKER_INFLUXDB_INIT_USERNAME:    admin
@@ -85,6 +87,32 @@ services:
       - financeai-net
 
   # ─── Airflow ─────────────────────────────────────────────────────────────
+  # One-off: creates Airflow's schema (`airflow db migrate`) and an admin
+  # user. Neither webserver nor scheduler do this themselves — the official
+  # Airflow docker-compose template always includes this as a separate step;
+  # skipping it is why webserver/scheduler exit immediately with "You need
+  # to initialize the database."
+  airflow-init:
+    image: apache/airflow:2.10.0
+    container_name: financeai-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname Admin --lastname User --role Admin \
+          --email admin@financeai.io || true
+    environment:
+      AIRFLOW__CORE__EXECUTOR:             LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://finai:finai@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES:        "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - financeai-net
+
   airflow-webserver:
     image: apache/airflow:2.10.0
     container_name: financeai-airflow
@@ -104,7 +132,8 @@ services:
       - ../models_store:/app/models_store
       - airflow_logs:/opt/airflow/logs
     depends_on:
-      - postgres
+      airflow-init:
+        condition: service_completed_successfully
     networks:
       - financeai-net
 
@@ -123,7 +152,8 @@ services:
       - ../models_store:/app/models_store
       - airflow_logs:/opt/airflow/logs
     depends_on:
-      - postgres
+      airflow-init:
+        condition: service_completed_successfully
     networks:
       - financeai-net
 

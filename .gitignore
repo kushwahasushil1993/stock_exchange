@@ -15,7 +15,9 @@ airflow-venv/
 
 # Environment / secrets
 .env
+.env.docker
 FinanceAI/.env
+FinanceAI/.env.docker
 
 # Airflow local runtime
 airflow/
