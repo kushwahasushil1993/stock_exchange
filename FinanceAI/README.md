@@ -122,7 +122,7 @@
 ## ✅ Prerequisites
 
 ### Local Development
-- Python **3.11+**
+- Python **3.12+**
 - PostgreSQL **14+**
 - Redis **6+**
 - Git
@@ -158,6 +158,10 @@ pip install --upgrade pip
 
 # Install all dependencies
 pip install -r requirements.txt
+
+# Install the project itself (editable) so `src` and `config` import
+# from any working directory / from your IDE
+pip install -e .
 ```
 
 > ⚠️ **Note on TensorFlow**: If you're on Apple Silicon (M1/M2), replace `tensorflow` with `tensorflow-macos` in `requirements.txt` before installing.
@@ -427,7 +431,7 @@ sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y \
     git curl wget unzip \
     build-essential libpq-dev \
-    python3.11 python3.11-venv python3-pip \
+    python3.12 python3.12-venv python3-pip \
     nginx certbot python3-certbot-nginx \
     ufw
 
@@ -787,6 +791,15 @@ Market Opens (9:15 AM IST)
 ---
 
 ### Setup Airflow Locally
+
+Airflow pins `SQLAlchemy < 2.0` and conflicts with the app's `sqlalchemy==2.0.30`,
+so install it in its **own** virtualenv (not the app venv):
+
+```bash
+python3.12 -m venv airflow-venv
+source airflow-venv/bin/activate
+pip install -r requirements-airflow.txt
+```
 
 ```bash
 # Set Airflow home directory

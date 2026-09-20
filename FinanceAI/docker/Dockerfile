@@ -1,10 +1,12 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
 # System dependencies
+# libgomp1: OpenMP runtime — xgboost/lightgbm import-fail without it on slim
+# Debian images (not pulled in automatically by gcc/g++ here).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libpq-dev curl git \
+    gcc g++ libpq-dev libgomp1 curl git \
     && rm -rf /var/lib/apt/lists/*
 
 # Python dependencies

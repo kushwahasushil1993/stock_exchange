@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "financeai"
+version = "0.1.0"
+description = "AI-Powered Stock & MF Intelligence for Indian equity markets"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+# `src` and `config` are imported as top-level packages (e.g. `from src.api.main
+# import app`, `from config.settings import settings`). Install this project in
+# editable mode so those imports resolve from any working directory:
+#   pip install -e .
+packages = ["src", "config"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

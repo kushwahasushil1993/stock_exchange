@@ -9,7 +9,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 
 from src.database.models import get_db, Prediction, Stock
 from src.database.models import redis_cache
@@ -76,7 +76,7 @@ async def _fetch_latest_prediction_rows(
     limit: int = 100,
 ):
     subq = (
-        select(Prediction.stock_id, Prediction.predicted_at.label("latest"))
+        select(Prediction.stock_id, func.max(Prediction.predicted_at).label("latest"))
         .group_by(Prediction.stock_id)
         .subquery()
     )

@@ -1,0 +1,54 @@
+# Render Blueprint — free path, no credit card required anywhere.
+#
+# Postgres and Redis are NOT Render's own add-ons: Render's free Postgres is
+# a 30-day trial (auto-deleted after), not a lasting free tier. Use external
+# always-free managed services instead:
+#   - Postgres: https://neon.tech      -> create a project, copy its connection string
+#   - Redis:    https://upstash.com    -> create a database, copy its connection string
+# Then paste both into this service's env vars in the Render dashboard
+# (marked `sync: false` below so Render prompts for them instead of baking
+# them into this file).
+services:
+  - type: web
+    name: financeai-api
+    runtime: docker
+    plan: free                    # Render's free web service plan — 512MB RAM, sleeps after 15min idle
+    region: oregon
+    rootDir: FinanceAI
+    dockerfilePath: docker/Dockerfile
+    dockerContext: .
+    # Override the Dockerfile's default 4 workers — each uvicorn worker loads
+    # its own copy of TensorFlow/PyTorch; 4x that would blow well past 512MB.
+    dockerCommand: >-
+      uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+      --workers 1 --log-level info
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: POSTGRES_URL         # from Neon — paste as postgresql://... (models.py
+        sync: false               # auto-adds +asyncpg if you paste the bare form)
+      - key: REDIS_URL            # from Upstash — paste as redis://... or rediss://...
+        sync: false
+      # InfluxDB isn't wired into the live API path (src/api/) — only
+      # referenced by DAGs/scripts — so it's omitted here.
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: ALPHAVANTAGE_KEY
+        sync: false
+      - key: FMP_API_KEY
+        sync: false
+      - key: POLYGON_API_KEY
+        sync: false
+      - key: NSE_COOKIE
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false

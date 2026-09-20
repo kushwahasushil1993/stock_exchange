@@ -505,8 +505,13 @@ class MutualFundRecommender:
         df = mf_df.copy()
 
         # Filter by risk profile
+        # AMFI's raw category strings are verbose, e.g.
+        # "Open Ended Schemes(Equity Scheme - Large Cap Fund)" — never equal
+        # to the short labels below, so match by substring instead of isin().
         profile_categories = self._get_profile_categories(risk_profile)
-        df = df[df["category"].isin(profile_categories)]
+        df = df[df["category"].apply(
+            lambda c: any(pc.lower() in str(c).lower() for pc in profile_categories)
+        )]
 
         if category_filter:
             df = df[df["category"].str.contains(category_filter, case=False, na=False)]

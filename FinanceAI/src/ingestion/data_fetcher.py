@@ -64,20 +64,38 @@ class YFinanceFetcher:
         return result
 
     def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info or {}
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info or {}
+        except Exception as exc:
+            # Yahoo rate-limits (HTTP 429) aggressively and yfinance sometimes
+            # surfaces that as a raw JSONDecodeError instead of a clean error —
+            # degrade gracefully instead of crashing the caller.
+            logger.warning("Failed to fetch fundamentals for %s: %s", symbol, exc)
+            info = {}
+
+        def _finite(val: Any) -> Optional[float]:
+            # Yahoo sometimes returns the literal string "Infinity"/"NaN", or a
+            # real inf/nan float, for metrics like PE when earnings are ~0 —
+            # none of those are valid Postgres float params.
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                return None
+            return f if np.isfinite(f) else None
+
         return {
-            "pe_ratio": info.get("trailingPE"),
-            "pb_ratio": info.get("priceToBook"),
-            "roe": info.get("returnOnEquity"),
-            "debt_to_equity": info.get("debtToEquity"),
-            "revenue_growth_yoy": info.get("revenueGrowth"),
-            "profit_margin": info.get("profitMargins"),
-            "dividend_yield": info.get("dividendYield"),
-            "beta": info.get("beta"),
-            "free_cash_flow": info.get("freeCashflow"),
-            "eps_growth": info.get("earningsGrowth"),
-            "market_cap": info.get("marketCap"),
+            "pe_ratio": _finite(info.get("trailingPE")),
+            "pb_ratio": _finite(info.get("priceToBook")),
+            "roe": _finite(info.get("returnOnEquity")),
+            "debt_to_equity": _finite(info.get("debtToEquity")),
+            "revenue_growth_yoy": _finite(info.get("revenueGrowth")),
+            "profit_margin": _finite(info.get("profitMargins")),
+            "dividend_yield": _finite(info.get("dividendYield")),
+            "beta": _finite(info.get("beta")),
+            "free_cash_flow": _finite(info.get("freeCashflow")),
+            "eps_growth": _finite(info.get("earningsGrowth")),
+            "market_cap": _finite(info.get("marketCap")),
             "sector": info.get("sector"),
             "industry": info.get("industry"),
             "company_name": info.get("longName"),
@@ -96,6 +114,79 @@ class YFinanceFetcher:
             "puts": chain.puts,
             "expiry": nearest,
         }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NSE Universe Fetcher — full listed-equity / F&O-eligible symbol lists
+# ════════════════════════════════════════════════════════════════════════════
+class NSEUniverseFetcher:
+    """
+    Fetch the full universe of NSE-listed symbols from NSE's public archive
+    (static files, no session/cookie dance needed — unlike the live NSE API).
+    """
+    EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    FNO_LIST_URL = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    # Index derivatives that appear in fo_mktlots.csv alongside single-stock ones
+    INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "NIFTYFPI"}
+
+    async def fetch_equity_symbols(self) -> List[Dict[str, str]]:
+        """
+        All NSE main-board (SERIES == EQ) listed equities.
+        Returns [{"symbol": "RELIANCE", "yf_symbol": "RELIANCE.NS", "company_name": "..."}]
+        """
+        import csv
+        import io
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(self.EQUITY_LIST_URL, headers=self.HEADERS) as resp:
+                text = await resp.text()
+
+        reader = csv.DictReader(io.StringIO(text))
+        result = []
+        for row in reader:
+            row = {k.strip(): (v.strip() if v else v) for k, v in row.items()}
+            if row.get("SERIES") != "EQ":
+                continue
+            symbol = row.get("SYMBOL", "")
+            if not symbol:
+                continue
+            result.append({
+                "symbol": symbol,
+                "yf_symbol": f"{symbol}.NS",
+                "company_name": row.get("NAME OF COMPANY", symbol),
+            })
+        return result
+
+    async def fetch_fno_symbols(self) -> List[str]:
+        """
+        All single-stock F&O-eligible symbols (index futures like NIFTY/BANKNIFTY
+        excluded — those aren't equity tickers). Returns yfinance-formatted symbols.
+        """
+        import csv
+        import io
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(self.FNO_LIST_URL, headers=self.HEADERS) as resp:
+                text = await resp.text()
+
+        reader = csv.reader(io.StringIO(text))
+        next(reader, None)  # header row
+        symbols = []
+        for row in reader:
+            if len(row) < 2:
+                continue
+            sym = row[1].strip()
+            if not sym or sym.upper() in {"SYMBOL"} or sym.upper() in self.INDEX_SYMBOLS:
+                continue
+            symbols.append(f"{sym}.NS")
+        return symbols
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -119,7 +210,17 @@ class NSEFetcher:
     }
 
     async def _get_session_cookie(self, session: aiohttp.ClientSession) -> str:
-        """Obtain NSE session cookie required for API calls."""
+        """
+        Obtain the NSE session cookie required for API calls.
+
+        Uses NSE_COOKIE from settings if configured (a cookie captured from a
+        real browser session on nseindia.com — Akamai's bot manager otherwise
+        blocks plain server-to-server requests). It expires within hours, so
+        this is a stopgap; falls back to a fresh dynamic fetch when unset or
+        once NSE stops honoring it.
+        """
+        if settings.nse_cookie:
+            return settings.nse_cookie
         async with session.get(self.BASE_URL, headers=self.HEADERS) as resp:
             cookies = {k: v.value for k, v in resp.cookies.items()}
             return "; ".join([f"{k}={v}" for k, v in cookies.items()])
@@ -281,30 +382,60 @@ class AMFIFetcher:
         return pd.DataFrame()
 
     def _parse_amfi_nav(self, raw: str) -> pd.DataFrame:
+        """
+        AMFI's column layout has changed over time (older files had 6
+        semicolon fields: code;isin;isin;name;nav;date — the current live
+        feed has 8, with `Plan`/`Option` inserted before nav/date). Parse via
+        the header row's column names rather than hardcoded positions so a
+        future column reshuffle doesn't silently turn every `nav` into None.
+        """
         rows = []
         current_category = ""
         current_amc = ""
+        header: Optional[List[str]] = None
         for line in raw.splitlines():
             line = line.strip()
             if not line:
                 continue
             if line.startswith("Open Ended") or line.startswith("Close Ended"):
                 current_category = line
-            elif ";" not in line:
+                continue
+            if ";" not in line:
                 current_amc = line
+                continue
+
+            parts = [p.strip() for p in line.split(";")]
+            if parts[0] == "Scheme Code":
+                header = parts  # header row — capture column order, don't emit a row
+                continue
+
+            if header and len(parts) == len(header):
+                row = dict(zip(header, parts))
+            elif len(parts) >= 6:
+                # Fallback for the legacy 6-column format
+                row = {
+                    "Scheme Code": parts[0],
+                    "ISIN Div Payout/ ISIN Growth": parts[1],
+                    "ISIN Div Reinvestment": parts[2],
+                    "Scheme Name": parts[3],
+                    "Net Asset Value": parts[4],
+                    "Date": parts[5],
+                }
             else:
-                parts = line.split(";")
-                if len(parts) >= 6:
-                    rows.append({
-                        "scheme_code": parts[0].strip(),
-                        "isin_div_payout": parts[1].strip(),
-                        "isin_div_reinvest": parts[2].strip(),
-                        "scheme_name": parts[3].strip(),
-                        "nav": self._safe_float(parts[4]),
-                        "date": parts[5].strip(),
-                        "category": current_category,
-                        "amc": current_amc,
-                    })
+                continue
+
+            rows.append({
+                "scheme_code": row.get("Scheme Code", ""),
+                "isin_div_payout": row.get("ISIN Div Payout/ ISIN Growth", ""),
+                "isin_div_reinvest": row.get("ISIN Div Reinvestment", ""),
+                "scheme_name": row.get("Scheme Name", ""),
+                "plan": row.get("Plan", ""),
+                "option": row.get("Option", ""),
+                "nav": self._safe_float(row.get("Net Asset Value", "")),
+                "date": row.get("Date", ""),
+                "category": current_category,
+                "amc": current_amc,
+            })
         return pd.DataFrame(rows)
 
     async def fetch_historical_nav(self, scheme_code: str) -> pd.DataFrame:

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+myenv/
+venv/
+.venv/
+env/
+airflow-venv/
+
+# Environment / secrets
+.env
+FinanceAI/.env
+
+# Airflow local runtime
+airflow/
+*.db
+
+# OS
+.DS_Store

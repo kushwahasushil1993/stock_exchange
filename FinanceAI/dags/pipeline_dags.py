@@ -5,18 +5,29 @@ Apache Airflow DAGs:
   3. daily_prediction_pipeline    — run predictions for all watchlist symbols
   4. mf_data_refresh              — refresh MF NAVs daily
 """
-from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+from datetime import timedelta
+
+import pendulum
+
+try:  # Airflow 3.x
+    from airflow.sdk import DAG
+    from airflow.providers.standard.operators.python import PythonOperator
+except ImportError:  # Airflow 2.x
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+
+# Static start_date (Airflow best practice; replaces the removed
+# airflow.utils.dates.days_ago helper).
+START_DATE = pendulum.datetime(2024, 1, 1, tz="UTC")
 
 DEFAULT_ARGS = {
     "owner":            "financeai",
     "depends_on_past":  False,
     "retries":          2,
     "retry_delay":      timedelta(minutes=5),
-    "email_on_failure": True,
-    "email":            ["alerts@financeai.io"],
+    # Task-level `email` / `email_on_failure` are deprecated (removed in
+    # Airflow 4). For failure alerts, attach an on_failure_callback, e.g.
+    # airflow.providers.smtp.notifications.smtp.SmtpNotifier.
 }
 
 
@@ -71,7 +82,7 @@ with DAG(
     dag_id      = "daily_market_data_ingestion",
     description = "Fetch OHLCV, news, and macro data",
     schedule    = "30 9 * * 1-5",   # 9:30 AM IST weekdays (4:00 UTC)
-    start_date  = days_ago(1),
+    start_date  = START_DATE,
     default_args= DEFAULT_ARGS,
     catchup     = False,
     tags        = ["ingestion", "market-data"],
@@ -176,7 +187,7 @@ with DAG(
     dag_id       = "daily_prediction_pipeline",
     description  = "Run ML ensemble predictions for all watchlist stocks",
     schedule     = "0 10 * * 1-5",   # 10 AM IST weekdays
-    start_date   = days_ago(1),
+    start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
     catchup      = False,
     tags         = ["predictions", "ml"],
@@ -239,7 +250,7 @@ with DAG(
     dag_id       = "weekly_model_retraining",
     description  = "Retrain all ML models on fresh data",
     schedule     = "0 2 * * 0",   # Sunday 2 AM UTC
-    start_date   = days_ago(7),
+    start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
     catchup      = False,
     tags         = ["training", "ml"],

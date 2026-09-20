@@ -225,9 +225,21 @@ class PaymentTransaction(Base):
     user: Mapped["User"] = relationship("User", back_populates="payments")
 
 
+def _asyncpg_url(url: str) -> str:
+    """
+    Managed Postgres add-ons (Render, Railway, Heroku, ...) hand back a plain
+    postgresql:// (or the older postgres://) connection string with no
+    driver — create_async_engine requires the +asyncpg dialect explicitly.
+    """
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix) and "+asyncpg" not in url.split("://", 1)[0]:
+            return "postgresql+asyncpg://" + url[len(prefix):]
+    return url
+
+
 # ─── Engine & Session Factory ────────────────────────────────────────────────
 engine = create_async_engine(
-    settings.postgres_url,
+    _asyncpg_url(settings.postgres_url),
     echo=settings.debug,
     pool_size=10,
     max_overflow=20,
