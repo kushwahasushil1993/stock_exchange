@@ -10,6 +10,9 @@ services:
     container_name: financeai-api
     ports:
       - "8000:8000"
+    env_file:
+      - ../.env   # SECRET_KEY, NEWSAPI_KEY, RAZORPAY_*, etc. — the 4 vars
+                  # below override it with compose-internal service hostnames
     environment:
       - POSTGRES_URL=postgresql+asyncpg://finai:finai@postgres:5432/financeai
       - REDIS_URL=redis://redis:6379/0

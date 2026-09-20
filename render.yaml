@@ -1,0 +1,58 @@
+databases:
+  - name: financeai-db
+    databaseName: financeai
+    user: finai
+    plan: free
+    region: oregon
+
+services:
+  - type: redis
+    name: financeai-redis
+    plan: free
+    region: oregon
+    ipAllowList: []
+
+  - type: web
+    name: financeai-api
+    runtime: docker
+    rootDir: FinanceAI
+    dockerfilePath: docker/Dockerfile
+    dockerContext: .
+    plan: starter
+    region: oregon
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: POSTGRES_URL
+        fromDatabase:
+          name: financeai-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: financeai-redis
+          property: connectionString
+      # InfluxDB isn't wired into the live API path (src/api/) — only
+      # referenced by DAGs/scripts — so it's omitted here. Add a private
+      # `image: influxdb:2.7` service later if a router actually needs it.
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: ALPHAVANTAGE_KEY
+        sync: false
+      - key: FMP_API_KEY
+        sync: false
+      - key: POLYGON_API_KEY
+        sync: false
+      - key: NSE_COOKIE
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
