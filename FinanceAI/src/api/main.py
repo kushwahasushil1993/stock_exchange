@@ -12,7 +12,7 @@ import uvicorn
 
 from config.settings import settings
 from src.database.models import init_db, redis_cache
-from src.api.routers import stocks, fno, mutual_funds, predictions, auth, health, top_buys
+from src.api.routers import stocks, fno, mutual_funds, predictions, auth, health, top_buys, analyze
 # from src.api.routers import payments  # Razorpay integration — disabled until needed
 from src.api.middleware.rate_limit import RateLimitMiddleware
 from src.api.middleware.logging_mw import RequestLoggingMiddleware
@@ -75,6 +75,7 @@ app.include_router(predictions.router,  prefix="/api/v1/predictions",  tags=["Pr
 app.include_router(fno.router,          prefix="/api/v1/fno",          tags=["FNO"])
 app.include_router(top_buys.router,     prefix="/api/v1/top-buys",     tags=["Top Buys"])
 app.include_router(mutual_funds.router, prefix="/api/v1/mutual-funds", tags=["Mutual Funds"])
+app.include_router(analyze.router,      prefix="/api/v1/analyze",      tags=["Analyze"])
 
 
 if __name__ == "__main__":
