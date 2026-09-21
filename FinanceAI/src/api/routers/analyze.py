@@ -18,7 +18,8 @@ router = APIRouter()
 
 _EQUITY_CACHE_KEY = "analyze:equity_universe"
 _FNO_CACHE_KEY = "analyze:fno_universe"
-_CACHE_TTL = 24 * 3600  # NSE's listed-symbol file changes rarely
+_MF_CACHE_KEY = "analyze:mf_universe"
+_CACHE_TTL = 24 * 3600  # NSE's listed-symbol file / AMFI's scheme list change rarely
 
 
 # ─── Symbol / fund resolution ────────────────────────────────────────────────
@@ -46,6 +47,27 @@ async def _get_fno_universe() -> set:
     symbols = await NSEUniverseFetcher().fetch_fno_symbols()
     await redis_cache.set(_FNO_CACHE_KEY, json.dumps(symbols), ttl=_CACHE_TTL)
     return set(symbols)
+
+
+async def _get_mf_universe() -> List[Dict[str, str]]:
+    """Lightweight {scheme_code, scheme_name, category, amc} for ~14k AMFI
+    schemes — cached separately from the full NAV DataFrame /analyze/mutual-
+    fund fetches, since suggestions only need names, not live NAVs."""
+    import json
+
+    cached = await redis_cache.get(_MF_CACHE_KEY)
+    if cached:
+        return json.loads(cached)
+
+    from src.ingestion.data_fetcher import AMFIFetcher
+    nav_df = await AMFIFetcher().fetch_all_navs()
+    records = (
+        nav_df[["scheme_code", "scheme_name", "category", "amc"]]
+        .dropna(subset=["scheme_code", "scheme_name"])
+        .to_dict("records")
+    )
+    await redis_cache.set(_MF_CACHE_KEY, json.dumps(records), ttl=_CACHE_TTL)
+    return records
 
 
 async def _resolve_equity(query: str) -> Dict[str, str]:
@@ -181,7 +203,74 @@ def _strip_internal(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if not k.startswith("_")}
 
 
+class SuggestOut(BaseModel):
+    value: str   # what to pass back into ?query= on /stock, /fno, or /mutual-fund
+    label: str   # what to show the user
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
+@router.get("/suggest", response_model=List[SuggestOut])
+async def suggest(
+    asset_type: str = Query(..., alias="type", pattern="^(stock|fno|mutual-fund)$"),
+    query: str = Query(..., min_length=1),
+    limit: int = Query(default=8, ge=1, le=20),
+    _user: User = Depends(get_current_user),
+):
+    """
+    Typeahead for the Analyze page's search box — searches server-side
+    against the cached NSE equity/F&O list or AMFI scheme list (~2,300 and
+    ~14,000 entries respectively; too much to ship to the browser for
+    client-side filtering) and returns a short ranked list of matches.
+    """
+    q = query.strip().lower()
+    if not q:
+        return []
+
+    if asset_type in ("stock", "fno"):
+        universe = await _get_equity_universe()
+        if asset_type == "fno":
+            fno_symbols = await _get_fno_universe()
+            universe = [e for e in universe if e["yf_symbol"] in fno_symbols]
+
+        matches = [
+            e for e in universe
+            if q in e["symbol"].lower() or q in e["company_name"].lower()
+        ]
+        matches.sort(key=lambda e: (
+            0 if e["symbol"].lower().startswith(q) or e["company_name"].lower().startswith(q) else 1,
+            e["company_name"],
+        ))
+        return [
+            SuggestOut(value=e["yf_symbol"], label=f"{e['company_name']} ({e['symbol']})")
+            for e in matches[:limit]
+        ]
+
+    # mutual-fund
+    universe = await _get_mf_universe()
+    matches = [
+        m for m in universe
+        if q in m["scheme_name"].lower() or q in m["scheme_code"].lower() or q in m["amc"].lower()
+    ]
+    matches.sort(key=lambda m: (
+        0 if m["scheme_name"].lower().startswith(q) else 1,
+        m["scheme_name"],
+    ))
+    # AMFI lists separate rows per plan/option (Direct/Regular, Growth/IDCW)
+    # under the same scheme_name — /analyze/mutual-fund resolves by
+    # scheme_name substring match anyway (takes the first hit), so dedupe
+    # here rather than showing 3-4 near-identical entries per fund.
+    seen = set()
+    out = []
+    for m in matches:
+        if m["scheme_name"] in seen:
+            continue
+        seen.add(m["scheme_name"])
+        out.append(SuggestOut(value=m["scheme_name"], label=f"{m['scheme_name']} — {m['amc']}"))
+        if len(out) >= limit:
+            break
+    return out
+
+
 @router.get("/stock", response_model=StockAnalysisOut)
 async def analyze_stock(
     query: str = Query(..., description="Ticker (RELIANCE / RELIANCE.NS) or company name"),
