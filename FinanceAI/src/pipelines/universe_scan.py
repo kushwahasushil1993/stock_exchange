@@ -116,6 +116,20 @@ def fetch_and_predict(symbol: str, is_fno: bool) -> Dict:
         return {"symbol": symbol, "error": str(exc)}
 
 
+def _categorize_error(err: str) -> str:
+    """
+    Only "rate_limited" and "other" are worth retrying — a symbol with
+    genuinely insufficient trading history (a recent IPO, thinly-traded
+    small-cap) will fail the exact same way next time, no matter how many
+    times it's retried.
+    """
+    if "Too Many Requests" in err or "Rate limited" in err or "429" in err:
+        return "rate_limited"
+    if "insufficient OHLCV" in err:
+        return "insufficient_data"
+    return "other"
+
+
 async def persist_result(db, result: Dict) -> None:
     symbol = result["symbol"]
     fund = result["fund"]
@@ -150,6 +164,7 @@ async def persist_result(db, result: Dict) -> None:
         model_version="universe-scan-v1",
         signal=SignalType(pred["signal"]),
         confidence=pred["confidence"],
+        current_price=pred.get("current_price"),
         predicted_return_1d=None,
         predicted_return_5d=pred.get("predicted_return_5d"),
         predicted_return_1m=None,
@@ -181,6 +196,82 @@ async def persist_result(db, result: Dict) -> None:
         ))
 
 
+async def _scan_pass(
+    symbol_fno_pairs: List,
+    workers: int,
+    progress_state: Dict,
+    total_overall: int,
+    start_time: float,
+    on_progress: Optional[Callable[[Dict], None]],
+) -> Dict:
+    """
+    One pass over a list of (symbol, is_fno) pairs. Persists successes as it
+    goes (batched); returns aggregate counts plus the (symbol, is_fno, reason)
+    triples worth retrying (rate-limited/other — not insufficient-data, which
+    would just fail identically next time).
+    """
+    loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=workers)
+
+    ok = fail = 0
+    buy = sell = hold = 0
+    retryable = []
+    reason_counts: Dict[str, int] = {}
+    BATCH = 50
+    batch: List[Dict] = []
+
+    async def flush_batch():
+        nonlocal batch
+        if not batch:
+            return
+        async with AsyncSessionFactory() as db:
+            for r in batch:
+                await persist_result(db, r)
+            await db.commit()
+        batch = []
+
+    is_fno_by_symbol = dict(symbol_fno_pairs)
+    tasks = [
+        loop.run_in_executor(executor, fetch_and_predict, sym, is_fno)
+        for sym, is_fno in symbol_fno_pairs
+    ]
+    for i, coro in enumerate(asyncio.as_completed(tasks), start=1):
+        result = await coro
+        if "error" in result:
+            fail += 1
+            reason = _categorize_error(result["error"])
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if reason in ("rate_limited", "other"):
+                retryable.append((result["symbol"], is_fno_by_symbol[result["symbol"]]))
+        else:
+            ok += 1
+            sig = result["pred"]["signal"]
+            buy += sig == "BUY"
+            sell += sig == "SELL"
+            hold += sig == "HOLD"
+            batch.append(result)
+            if len(batch) >= BATCH:
+                await flush_batch()
+
+        scanned = progress_state["scanned"] + i
+        if i % 50 == 0 or i == len(symbol_fno_pairs):
+            elapsed = round(time.time() - start_time)
+            live = {
+                "scanned": scanned, "total": total_overall,
+                "ok": progress_state["ok"] + ok, "failed": progress_state["failed"] + fail,
+                "buy": progress_state["buy"] + buy, "sell": progress_state["sell"] + sell,
+                "hold": progress_state["hold"] + hold, "elapsed_s": elapsed,
+            }
+            if on_progress:
+                on_progress({"event": "progress", **live})
+            await _set_status(state="running", **live)
+
+    await flush_batch()
+    executor.shutdown(wait=True)
+    return {"ok": ok, "fail": fail, "buy": buy, "sell": sell, "hold": hold,
+            "retryable": retryable, "reason_counts": reason_counts}
+
+
 async def run_universe_scan(
     limit: Optional[int] = None,
     workers: int = 8,
@@ -188,10 +279,17 @@ async def run_universe_scan(
     on_progress: Optional[Callable[[Dict], None]] = None,
 ) -> Dict:
     """
-    Runs the scan to completion. Updates STATUS_KEY in Redis as it goes (so
-    a caller that can't hold the request open — the API trigger — can poll
-    progress) and also calls on_progress(dict), if given, for callers that
-    can print directly (the CLI script).
+    Runs the scan to completion, then automatically retries rate-limited (and
+    otherwise transiently-failed) symbols in up to 2 more cooldown passes at
+    reduced concurrency — Yahoo's rate-limit window is short-lived, so most
+    of a first pass's failures at high symbol counts are recoverable a
+    minute or two later, not permanent. Genuinely bad symbols (insufficient
+    trading history) are never retried, since they'd fail identically again.
+
+    Updates STATUS_KEY in Redis as it goes (so a caller that can't hold the
+    request open — the API trigger — can poll progress) and also calls
+    on_progress(dict), if given, for callers that can print directly (the
+    CLI script).
     """
     await init_db()
     await _set_status(state="running", scanned=0, total=0, ok=0, failed=0,
@@ -215,58 +313,52 @@ async def run_universe_scan(
         await _set_status(state="running", scanned=0, total=total, ok=0, failed=0,
                            buy=0, sell=0, hold=0, started_at=datetime.utcnow().isoformat())
 
-        loop = asyncio.get_event_loop()
-        executor = ThreadPoolExecutor(max_workers=workers)
-
-        ok = fail = 0
-        buy = sell = hold = 0
         start = time.time()
-        BATCH = 50
-        batch: List[Dict] = []
+        ok = fail = buy = sell = hold = 0
+        reason_totals: Dict[str, int] = {}
+        pairs = [(sym, sym in fno_symbols) for sym in symbols]
 
-        async def flush_batch():
-            nonlocal batch
-            if not batch:
-                return
-            async with AsyncSessionFactory() as db:
-                for r in batch:
-                    await persist_result(db, r)
-                await db.commit()
-            batch = []
+        MAX_RETRY_ROUNDS = 2
+        round_num = 0
+        while pairs:
+            pass_workers = workers if round_num == 0 else max(2, workers // 2)
+            progress_state = {"scanned": ok + fail, "ok": ok, "failed": fail,
+                               "buy": buy, "sell": sell, "hold": hold}
+            pass_result = await _scan_pass(pairs, pass_workers, progress_state, total, start, on_progress)
 
-        tasks = [
-            loop.run_in_executor(executor, fetch_and_predict, sym, sym in fno_symbols)
-            for sym in symbols
-        ]
-        for i, coro in enumerate(asyncio.as_completed(tasks), start=1):
-            result = await coro
-            if "error" in result:
-                fail += 1
-            else:
-                ok += 1
-                sig = result["pred"]["signal"]
-                buy += sig == "BUY"
-                sell += sig == "SELL"
-                hold += sig == "HOLD"
-                batch.append(result)
-                if len(batch) >= BATCH:
-                    await flush_batch()
+            ok += pass_result["ok"]
+            fail += pass_result["fail"]
+            buy += pass_result["buy"]
+            sell += pass_result["sell"]
+            hold += pass_result["hold"]
+            for reason, n in pass_result["reason_counts"].items():
+                reason_totals[reason] = reason_totals.get(reason, 0) + n
 
-            if i % 50 == 0 or i == total:
-                elapsed = round(time.time() - start)
-                if on_progress:
-                    on_progress({"event": "progress", "scanned": i, "total": total,
-                                 "ok": ok, "failed": fail, "buy": buy, "sell": sell,
-                                 "hold": hold, "elapsed_s": elapsed})
-                await _set_status(state="running", scanned=i, total=total, ok=ok, failed=fail,
-                                   buy=buy, sell=sell, hold=hold, elapsed_s=elapsed)
+            retryable = pass_result["retryable"]
+            round_num += 1
+            if not retryable or round_num > MAX_RETRY_ROUNDS:
+                if retryable:
+                    logger.warning(
+                        "%d symbols still failing after %d retry rounds, giving up: %s",
+                        len(retryable), MAX_RETRY_ROUNDS,
+                        ", ".join(s for s, _ in retryable[:20]) + (" ..." if len(retryable) > 20 else ""),
+                    )
+                break
 
-        await flush_batch()
-        executor.shutdown(wait=True)
+            # These are still counted as "failed" above until a retry round
+            # actually succeeds on them — back that out before re-scanning.
+            fail -= len(retryable)
+            cooldown = 20 * round_num
+            logger.info("Retry round %d: %d symbols, cooling down %ds first", round_num, len(retryable), cooldown)
+            await asyncio.sleep(cooldown)
+            pairs = retryable
+
+        logger.info("Universe scan failure breakdown: %s", reason_totals or "none")
 
         summary = {
             "state": "completed", "scanned": total, "total": total,
             "ok": ok, "failed": fail, "buy": buy, "sell": sell, "hold": hold,
+            "failure_reasons": reason_totals,
             "elapsed_s": round(time.time() - start),
             "completed_at": datetime.utcnow().isoformat(),
         }

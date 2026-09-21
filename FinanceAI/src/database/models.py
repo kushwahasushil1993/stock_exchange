@@ -98,6 +98,7 @@ class Prediction(Base):
     model_version: Mapped[str] = mapped_column(String(50))
     signal: Mapped[SignalType] = mapped_column(Enum(SignalType))
     confidence: Mapped[float] = mapped_column(Float)
+    current_price: Mapped[Optional[float]] = mapped_column(Float)
     predicted_return_1d: Mapped[Optional[float]] = mapped_column(Float)
     predicted_return_5d: Mapped[Optional[float]] = mapped_column(Float)
     predicted_return_1m: Mapped[Optional[float]] = mapped_column(Float)

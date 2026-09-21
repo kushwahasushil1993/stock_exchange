@@ -9,9 +9,10 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func
+from sqlalchemy import select, desc, func, or_
+from sqlalchemy.orm import aliased
 
-from src.database.models import get_db, Prediction, Stock
+from src.database.models import get_db, Prediction, SignalType, Stock
 from src.database.models import redis_cache
 from src.api.routers.auth import get_current_user, User
 from config.settings import settings
@@ -47,6 +48,30 @@ class TopPicksResponse(BaseModel):
     sell_picks:      List[PredictionOut]
     total_analyzed:  int
     generated_at:    str
+
+
+class StockRowOut(BaseModel):
+    symbol:              str
+    company_name:        str
+    sector:               Optional[str]
+    industry:             Optional[str]
+    market_cap:           Optional[float]
+    is_fno_eligible:      bool
+    signal:               Optional[str]
+    confidence:           Optional[float]
+    composite_score:      Optional[float]
+    current_price:        Optional[float]
+    target_price:         Optional[float]
+    stop_loss:             Optional[float]
+    predicted_return_5d:  Optional[float]
+    predicted_at:          Optional[str]
+
+
+class AllStocksResponse(BaseModel):
+    items:       List[StockRowOut]
+    total:       int
+    page:        int
+    page_size:   int
 
 
 class TradeAgentRequest(BaseModel):
@@ -123,7 +148,7 @@ async def get_top_picks(
             technical_score     = pred.technical_score or 0,
             fundamental_score   = pred.fundamental_score or 0,
             sentiment_score     = pred.sentiment_score or 0,
-            current_price       = 0,    # fetch from latest OHLCV separately
+            current_price       = pred.current_price or 0,
             target_price        = pred.target_price or 0,
             stop_loss           = pred.stop_loss or 0,
             risk_reward_ratio   = pred.risk_reward_ratio or 0,
@@ -145,6 +170,75 @@ async def get_top_picks(
 
     await redis_cache.set(cache_key, response.model_dump_json(), ttl=900)
     return response
+
+
+@router.get("/all", response_model=AllStocksResponse)
+async def list_all_stocks(
+    page:        int            = Query(default=1, ge=1),
+    page_size:   int            = Query(default=50, ge=1, le=200),
+    signal:      Optional[str]  = Query(default=None, pattern="^(BUY|SELL|HOLD)$"),
+    search:      Optional[str]  = Query(default=None, description="Filter by symbol or company name"),
+    db:          AsyncSession   = Depends(get_db),
+    _user:       User           = Depends(get_current_user),
+):
+    """
+    Every stock in the database (not just top picks), each with its latest
+    prediction if one exists. Backs the "All Stocks" page — paginated since
+    this can be thousands of rows after a full universe scan.
+    """
+    latest_sub = (
+        select(Prediction.stock_id, func.max(Prediction.predicted_at).label("latest"))
+        .group_by(Prediction.stock_id)
+        .subquery()
+    )
+    latest_pred = aliased(Prediction)
+
+    base_query = (
+        select(Stock, latest_pred)
+        .outerjoin(latest_sub, Stock.id == latest_sub.c.stock_id)
+        .outerjoin(
+            latest_pred,
+            (latest_pred.stock_id == latest_sub.c.stock_id) & (latest_pred.predicted_at == latest_sub.c.latest),
+        )
+    )
+    if signal:
+        base_query = base_query.where(latest_pred.signal == SignalType(signal))
+    if search:
+        like = f"%{search}%"
+        base_query = base_query.where(or_(Stock.symbol.ilike(like), Stock.company_name.ilike(like)))
+
+    total = (await db.execute(select(func.count()).select_from(base_query.subquery()))).scalar_one()
+
+    rows = (
+        await db.execute(
+            base_query
+            .order_by(desc(latest_pred.composite_score).nulls_last(), Stock.symbol)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    items = [
+        StockRowOut(
+            symbol=stock.symbol,
+            company_name=stock.company_name,
+            sector=stock.sector,
+            industry=stock.industry,
+            market_cap=stock.market_cap,
+            is_fno_eligible=stock.is_fno_eligible,
+            signal=pred.signal.value if pred else None,
+            confidence=pred.confidence if pred else None,
+            composite_score=pred.composite_score if pred else None,
+            current_price=pred.current_price if pred else None,
+            target_price=pred.target_price if pred else None,
+            stop_loss=pred.stop_loss if pred else None,
+            predicted_return_5d=pred.predicted_return_5d if pred else None,
+            predicted_at=pred.predicted_at.isoformat() if pred else None,
+        )
+        for stock, pred in rows
+    ]
+
+    return AllStocksResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 @router.post("/trade-agents/plan", response_model=TradeAgentPlanResponse)
@@ -257,10 +351,10 @@ async def universe_scan_status(_user: User = Depends(get_current_user)):
 async def _run_prediction_task(symbol: str, db: AsyncSession):
     """Background task: fetch data → features → predict → store."""
     try:
-        from src.ingestion.data_fetcher import YFinanceFetcher, NSEFetcher
+        from src.ingestion.data_fetcher import YFinanceFetcher, NSEFetcher, NewsFetcher
         from src.features.technical import TechnicalFeatures
         from src.models.ensemble.predictor import ModelOrchestrator
-        from src.sentiment.analyzer import NewsAggregator, NewsFetcher
+        from src.sentiment.analyzer import NewsAggregator
 
         # Fetch OHLCV
         yf = YFinanceFetcher()
@@ -299,6 +393,7 @@ async def _run_prediction_task(symbol: str, db: AsyncSession):
             model_version     = "1.0.0",
             signal            = result["signal"],
             confidence        = result["confidence"],
+            current_price     = result.get("current_price"),
             composite_score   = result["composite_score"],
             technical_score   = result["technical_score"],
             fundamental_score = result["fundamental_score"],
