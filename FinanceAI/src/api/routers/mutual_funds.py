@@ -1,11 +1,13 @@
 """Mutual Funds router — top MF recommendations by risk profile."""
 import asyncio
+import logging
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from src.api.routers.auth import get_current_user, User
 from src.recommendation.engine import MFRecommendation, MutualFundRecommender, RiskProfile
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -49,9 +51,17 @@ async def get_top_mutual_funds(
     sem = asyncio.Semaphore(20)
 
     async def _fetch_with_returns(row):
-        async with sem:
-            hist = await fetcher.fetch_historical_nav(str(row["scheme_code"]))
-        return {**row.to_dict(), **fetcher.compute_returns(hist)}
+        try:
+            async with sem:
+                hist = await fetcher.fetch_historical_nav(str(row["scheme_code"]))
+            return {**row.to_dict(), **fetcher.compute_returns(hist)}
+        except Exception as exc:
+            # mfapi.in is occasionally slow/flaky per-scheme — one timeout
+            # shouldn't take down the whole batch (asyncio.gather's default
+            # behavior on an unhandled exception: cancel every other
+            # in-flight task and raise, turning 199 good results into a 500).
+            logger.warning("Historical NAV fetch failed for %s: %s", row.get("scheme_code"), exc)
+            return {**row.to_dict()}  # no return_1y/3y/5y -> scores 0 on those, not excluded
 
     enriched_rows = await asyncio.gather(*(
         _fetch_with_returns(row) for _, row in open_ended.iterrows()
