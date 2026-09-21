@@ -219,6 +219,41 @@ async def trigger_prediction(
     return {"message": f"Prediction job queued for {symbol}", "symbol": symbol}
 
 
+@router.post("/run-universe", status_code=202)
+async def trigger_universe_scan(
+    background_tasks: BackgroundTasks,
+    _user: User = Depends(get_current_user),
+):
+    """
+    Fetch every NSE-listed stock (~2,300) and every F&O-eligible one among
+    them (~210), then run the prediction engine on all of it — no
+    parameters needed. Takes a couple of minutes, so it runs as a
+    background task; poll GET /run-universe/status for progress, or just
+    check /top-picks / /top-buys once it's done.
+    """
+    from src.pipelines.universe_scan import get_status, run_universe_scan
+
+    current = await get_status()
+    if current.get("state") == "running":
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "A universe scan is already running", "status": current},
+        )
+
+    background_tasks.add_task(run_universe_scan)
+    return {
+        "message": "Universe scan started — fetching all NSE stocks + F&O predictions in the background.",
+        "status_url": "/api/v1/predictions/run-universe/status",
+    }
+
+
+@router.get("/run-universe/status")
+async def universe_scan_status(_user: User = Depends(get_current_user)):
+    """Progress of the most recent (or currently running) universe scan."""
+    from src.pipelines.universe_scan import get_status
+    return await get_status()
+
+
 async def _run_prediction_task(symbol: str, db: AsyncSession):
     """Background task: fetch data → features → predict → store."""
     try:
