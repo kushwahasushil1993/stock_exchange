@@ -8,11 +8,12 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 import uvicorn
 
 from config.settings import settings
 from src.database.models import init_db, redis_cache
-from src.api.routers import stocks, fno, mutual_funds, predictions, auth, health, top_buys, analyze
+from src.api.routers import stocks, fno, mutual_funds, predictions, auth, health, top_buys, analyze, admin
 # from src.api.routers import payments  # Razorpay integration — disabled until needed
 from src.api.middleware.rate_limit import RateLimitMiddleware
 from src.api.middleware.logging_mw import RequestLoggingMiddleware
@@ -66,6 +67,13 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(RateLimitMiddleware, calls=100, period=60)
 app.add_middleware(RequestLoggingMiddleware)
 
+# ─── Metrics ─────────────────────────────────────────────────────────────────
+# prometheus-fastapi-instrumentator was already a pinned dependency and
+# monitoring/prometheus/prometheus.yml already scrapes api:8000/metrics every
+# 15s, but nothing ever actually called Instrumentator() — every scrape was a
+# 404, forever. This is the only line that was missing.
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
 # ─── Routers ─────────────────────────────────────────────────────────────────
 app.include_router(auth.router,         prefix="/api/v1/auth",         tags=["Authentication"])
 app.include_router(health.router,       prefix="/api/v1",              tags=["Health"])
@@ -76,6 +84,7 @@ app.include_router(fno.router,          prefix="/api/v1/fno",          tags=["FN
 app.include_router(top_buys.router,     prefix="/api/v1/top-buys",     tags=["Top Buys"])
 app.include_router(mutual_funds.router, prefix="/api/v1/mutual-funds", tags=["Mutual Funds"])
 app.include_router(analyze.router,      prefix="/api/v1/analyze",      tags=["Analyze"])
+app.include_router(admin.router,        prefix="/api/v1/admin",        tags=["Admin"])
 
 
 if __name__ == "__main__":

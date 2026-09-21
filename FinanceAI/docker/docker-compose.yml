@@ -53,6 +53,21 @@ services:
     networks:
       - financeai-net
 
+  # monitoring/prometheus/prometheus.yml scrapes postgres-exporter:9187 and
+  # redis-exporter:9121, but neither service existed — every scrape of those
+  # two jobs failed (unresolvable hostname), same class of gap as /metrics
+  # never being wired into the api service.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: financeai-postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://finai:finai@postgres:5432/financeai?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - financeai-net
+
   redis:
     image: redis:7-alpine
     container_name: financeai-redis
@@ -66,6 +81,17 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - financeai-net
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0-alpine
+    container_name: financeai-redis-exporter
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - financeai-net
 
@@ -180,6 +206,11 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin123
       GF_USERS_ALLOW_SIGN_UP:     "false"
+      # Grafana blocks framing (X-Frame-Options: deny) by default — the web
+      # frontend's Monitoring page embeds this in an iframe.
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED:   "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE:  Viewer
     volumes:
       - grafana_data:/var/lib/grafana
       - ../monitoring/grafana:/etc/grafana/provisioning

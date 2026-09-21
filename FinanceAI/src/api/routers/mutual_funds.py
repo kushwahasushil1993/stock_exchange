@@ -60,7 +60,13 @@ async def get_top_mutual_funds(
             # shouldn't take down the whole batch (asyncio.gather's default
             # behavior on an unhandled exception: cancel every other
             # in-flight task and raise, turning 199 good results into a 500).
-            logger.warning("Historical NAV fetch failed for %s: %s", row.get("scheme_code"), exc)
+            # str(exc) is empty for a bare asyncio.TimeoutError (the common
+            # case here) — include the exception type or the message is a
+            # useless "failed for 100470: " with nothing after the colon.
+            logger.warning(
+                "Historical NAV fetch failed for %s: %s: %s",
+                row.get("scheme_code"), type(exc).__name__, exc or "(no message)",
+            )
             return {**row.to_dict()}  # no return_1y/3y/5y -> scores 0 on those, not excluded
 
     enriched_rows = await asyncio.gather(*(
