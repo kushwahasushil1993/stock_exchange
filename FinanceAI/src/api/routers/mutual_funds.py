@@ -21,7 +21,23 @@ async def get_top_mutual_funds(
     consolidated /top-buys endpoint. This is a live snapshot (AMFI has no
     dated "prediction" history to filter by, unlike stocks/F&O), so it takes
     no date range.
+
+    This does up to 200 concurrent per-scheme historical-NAV network calls
+    (mfapi.in) — measured at 40-50s uncached. /predictions/top-picks already
+    caches in Redis for this exact reason; this had no caching at all, which
+    is why /top-buys (calls this for its mutual_funds section) was the slow
+    part of every Dashboard load despite the rest of the page being fast.
     """
+    import dataclasses
+    import json
+
+    from src.database.models import redis_cache
+
+    cache_key = f"mf_recommendations:{risk_profile}:{top_n}:{category or ''}"
+    cached = await redis_cache.get(cache_key)
+    if cached:
+        return [MFRecommendation(**item) for item in json.loads(cached)]
+
     from src.ingestion.data_fetcher import AMFIFetcher
     import pandas as pd
 
@@ -82,12 +98,16 @@ async def get_top_mutual_funds(
     enriched_df["expense_ratio"] = None
     enriched_df["aum"]           = None
 
-    return MutualFundRecommender().recommend(
+    recs = MutualFundRecommender().recommend(
         enriched_df,
         risk_profile    = RiskProfile(risk_profile),
         top_n           = top_n,
         category_filter = category,
     )
+    await redis_cache.set(
+        cache_key, json.dumps([dataclasses.asdict(r) for r in recs]), ttl=1800,
+    )
+    return recs
 
 
 class MFOut(BaseModel):
