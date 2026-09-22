@@ -3,7 +3,7 @@ Database layer: PostgreSQL (async), Redis cache, InfluxDB for OHLCV time-series.
 """
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Float, Integer, DateTime, Boolean, JSON, ForeignKey, Text, Enum
+from sqlalchemy import String, Float, Integer, DateTime, Date, Boolean, JSON, ForeignKey, Text, Enum, UniqueConstraint, BigInteger
 from datetime import datetime
 from typing import Optional, List
 import enum
@@ -68,6 +68,29 @@ class Stock(Base):
 
     predictions: Mapped[List["Prediction"]] = relationship("Prediction", back_populates="stock")
     fundamentals: Mapped[Optional["Fundamental"]] = relationship("Fundamental", back_populates="stock", uselist=False)
+    price_history: Mapped[List["PriceHistory"]] = relationship("PriceHistory", back_populates="stock")
+
+
+class PriceHistory(Base):
+    """
+    Daily OHLCV bars, persisted once per symbol so the prediction pipeline
+    reads from the DB instead of re-fetching 5y of history from Yahoo on
+    every single scan/analysis call (slow, rate-limit-prone, and the reason
+    nothing was ever actually stored/reusable before this table existed).
+    """
+    __tablename__ = "price_history"
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_price_history_stock_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"), index=True)
+    date: Mapped[datetime] = mapped_column(Date, index=True)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[Optional[int]] = mapped_column(BigInteger)
+
+    stock: Mapped["Stock"] = relationship("Stock", back_populates="price_history")
 
 
 class Fundamental(Base):

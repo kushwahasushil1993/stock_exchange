@@ -139,18 +139,32 @@ class ModelOrchestrator:
                 lstm_prob = float(preds[0])
 
         # ── XGBoost prediction ────────────────────────────────────────────────
+        # Per-symbol model first (none are trained today, but this leaves room
+        # to fine-tune one for a specific high-volume symbol later); otherwise
+        # fall back to the shared cross-sectional "_GLOBAL" model (see
+        # src/pipelines/train_global_model.py) instead of a hardcoded neutral
+        # 0.5 — that placeholder used to be the ONLY path actually reached,
+        # since models_store/ was empty, so every prediction's "ML" component
+        # was a constant no-signal value regardless of the stock.
         xgb_prob = 0.5
+        used_xgb_model = False
         xgb_path = self.model_base / "xgboost" / f"{symbol_clean}_xgb.pkl"
+        if not xgb_path.exists():
+            xgb_path = self.model_base / "xgboost" / "_GLOBAL_xgb.pkl"
         if xgb_path.exists():
             X_tab, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
             if len(X_tab) > 0:
                 xgb = XGBoostModel()
                 xgb.load(str(xgb_path))
                 xgb_prob = float(xgb.predict_proba(X_tab.iloc[-1:].values)[0])
+                used_xgb_model = True
 
         # ── LightGBM prediction ───────────────────────────────────────────────
         lgbm_prob = 0.5
+        used_lgbm_model = False
         lgbm_path = self.model_base / "lgbm" / f"{symbol_clean}_lgbm.pkl"
+        if not lgbm_path.exists():
+            lgbm_path = self.model_base / "lgbm" / "_GLOBAL_lgbm.pkl"
         if lgbm_path.exists():
             X_tab2, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
             if len(X_tab2) > 0:
@@ -160,13 +174,33 @@ class ModelOrchestrator:
                     lgbm.model = data["model"]
                     lgbm.feature_names = data["features"]
                 lgbm_prob = float(lgbm.predict_proba(X_tab2.iloc[-1:])[0])
+                used_lgbm_model = True
 
         # ── Ensemble ─────────────────────────────────────────────────────────
         ensemble = EnsemblePredictor()
         ensemble_path = self.model_base / "ensemble" / f"{symbol_clean}_ensemble.pkl"
         if ensemble_path.exists():
             ensemble.load(str(ensemble_path))
-        final_prob = ensemble.predict_stacked(lstm_prob, xgb_prob, lgbm_prob)
+
+        if not lstm_path.exists():
+            # LSTM per-symbol training isn't done (impractical for 2,300+
+            # symbols without a GPU) — its neutral 0.5 would otherwise dilute
+            # a third of the ensemble weight with a constant, uninformative
+            # value. Redistribute LSTM's weight across whichever of
+            # XGBoost/LightGBM actually ran a trained model, so the ensemble
+            # output is driven by real signal, not 1/3 hardcoded no-signal.
+            trained = [name for name, used in (("xgboost", used_xgb_model), ("lgbm", used_lgbm_model)) if used]
+            if trained:
+                w = ensemble.MODEL_WEIGHTS
+                lstm_w = w["lstm"]
+                bump = lstm_w / len(trained)
+                xgb_w = w["xgboost"] + (bump if "xgboost" in trained else 0)
+                lgbm_w = w["lgbm"] + (bump if "lgbm" in trained else 0)
+                final_prob = xgb_w * xgb_prob + lgbm_w * lgbm_prob
+            else:
+                final_prob = ensemble.predict_stacked(lstm_prob, xgb_prob, lgbm_prob)
+        else:
+            final_prob = ensemble.predict_stacked(lstm_prob, xgb_prob, lgbm_prob)
 
         # ── Composite score ───────────────────────────────────────────────────
         tech_score = self._technical_score(enriched)
@@ -215,6 +249,14 @@ class ModelOrchestrator:
             "predicted_return_5d": round((target - last_close) / last_close * 100, 2),
             "feature_importance": shap_imp,
             "predicted_at":      pd.Timestamp.utcnow().isoformat(),
+            # Transparency: which models actually produced xgb_prob/lgbm_prob
+            # above — "trained" (a real fitted model ran), "none" (no model
+            # file found, fell back to the neutral 0.5 placeholder).
+            "model_source": {
+                "xgboost": "trained" if used_xgb_model else "none",
+                "lgbm":    "trained" if used_lgbm_model else "none",
+                "lstm":    "trained" if lstm_path.exists() else "none",
+            },
         }
 
     def _technical_score(self, df: pd.DataFrame) -> float:

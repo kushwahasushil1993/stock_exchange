@@ -24,7 +24,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
+import pandas as pd
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database.models import (
     AssetType,
@@ -32,6 +34,7 @@ from src.database.models import (
     Fundamental,
     FNORecommendation,
     Prediction,
+    PriceHistory,
     SignalType,
     Stock,
     init_db,
@@ -107,7 +110,7 @@ def fetch_and_predict(symbol: str, is_fno: bool) -> Dict:
         orch = ModelOrchestrator()
         pred = orch.predict(symbol, ohlcv, fund, sentiment_score=0.0)
 
-        result = {"symbol": symbol, "fund": fund, "pred": pred, "is_fno": is_fno}
+        result = {"symbol": symbol, "fund": fund, "pred": pred, "is_fno": is_fno, "ohlcv": ohlcv}
         if is_fno:
             fno_rec = FNOAnalyzer().analyze(symbol, pred, option_chain={}, oi_data={})
             result["fno_rec"] = fno_rec
@@ -130,6 +133,42 @@ def _categorize_error(err: str) -> str:
     return "other"
 
 
+async def _persist_price_history(db, stock_id: int, ohlcv) -> None:
+    """
+    Bulk-upsert daily OHLCV bars so the prediction pipeline (and any future
+    training run) can read history straight from Postgres instead of
+    re-fetching it from Yahoo every time — nothing persisted it before this.
+    ON CONFLICT DO UPDATE so a re-scan refreshes bars Yahoo later revises
+    rather than silently skipping them.
+    """
+    if ohlcv is None or ohlcv.empty:
+        return
+    rows = [
+        {
+            "stock_id": stock_id,
+            "date": idx.date(),
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+        }
+        for idx, row in ohlcv.iterrows()
+    ]
+    if not rows:
+        return
+    stmt = pg_insert(PriceHistory).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["stock_id", "date"],
+        set_={
+            "open": stmt.excluded.open, "high": stmt.excluded.high,
+            "low": stmt.excluded.low, "close": stmt.excluded.close,
+            "volume": stmt.excluded.volume,
+        },
+    )
+    await db.execute(stmt)
+
+
 async def persist_result(db, result: Dict) -> None:
     symbol = result["symbol"]
     fund = result["fund"]
@@ -141,6 +180,8 @@ async def persist_result(db, result: Dict) -> None:
         stock = Stock(symbol=symbol, company_name=fund.get("company_name") or symbol)
         db.add(stock)
         await db.flush()
+
+    await _persist_price_history(db, stock.id, result.get("ohlcv"))
 
     stock.company_name = fund.get("company_name") or stock.company_name
     stock.sector = fund.get("sector")

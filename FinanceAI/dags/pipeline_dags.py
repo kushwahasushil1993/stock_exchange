@@ -99,93 +99,34 @@ with DAG(
 # DAG 2: Daily Prediction Pipeline
 # ════════════════════════════════════════════════════════════════════════════
 def run_predictions(**ctx):
-    """Run ensemble predictions for all watchlist symbols."""
-    import asyncio, json
-    from config.settings import settings
-    from src.ingestion.data_fetcher import YFinanceFetcher, NewsFetcher
-    from src.features.technical import TechnicalFeatures
-    from src.models.ensemble.predictor import ModelOrchestrator
-    from src.sentiment.analyzer import NewsAggregator
-    from src.recommendation.engine import StockScreener
+    """
+    Run ensemble predictions for the FULL NSE universe (~2,300 equities +
+    F&O + index F&O) — not just settings.watchlist_nse (20 hardcoded
+    large-caps). That 20-symbol list is what this task used to scan, which
+    is why the vast majority of NSE-listed stocks (small/mid-caps included —
+    e.g. Optiemus Infracom) never showed up anywhere in the app, and why
+    predictions looked repetitive day to day: the same tiny, static set was
+    the only thing ever refreshed on a schedule.
 
-    async def _fetch_news():
-        nf = NewsFetcher()
-        return await nf.fetch_all(settings.watchlist_nse)
+    src.pipelines.universe_scan.run_universe_scan() is the real, full-
+    coverage pipeline (also used by POST /api/v1/predictions/run-universe
+    and scripts/run_full_universe_pipeline.py) — it fetches the live NSE
+    equity + F&O + index lists itself, so this task doesn't need (and
+    shouldn't hardcode) a symbol list at all.
+    """
+    import asyncio
+    from src.pipelines.universe_scan import run_universe_scan
 
-    articles  = asyncio.run(_fetch_news())
-    agg       = NewsAggregator()
-    enriched  = agg.process_articles(articles)
-    sent_map  = agg.aggregate_by_symbol(enriched, settings.watchlist_nse)
+    def _log_progress(event: dict):
+        print(f"  {event}")
 
-    yf         = YFinanceFetcher()
-    orch       = ModelOrchestrator()
-    tf         = TechnicalFeatures()
-    all_preds  = []
-
-    for sym in settings.watchlist_nse:
-        try:
-            ohlcv = yf.fetch_ohlcv(sym, period="2y")
-            if ohlcv.empty:
-                continue
-            fund  = yf.fetch_fundamentals(sym)
-            score = sent_map.get(sym.replace(".NS", ""), 0.0)
-            pred  = orch.predict(sym, ohlcv, fund, score)
-            all_preds.append(pred)
-            print(f"  {sym}: {pred['signal']} ({pred['confidence']:.2%})")
-        except Exception as exc:
-            print(f"  ⚠️  {sym} failed: {exc}")
-
-    # Rank & screen
-    screener  = StockScreener()
-    top_buys  = screener.screen(all_preds, top_n=10, signal_filter="BUY")
-    top_sells = screener.screen(all_preds, top_n=5,  signal_filter="SELL")
-
-    print(f"\n🟢 Top BUY picks:")
-    for r in top_buys:
-        print(f"  #{r.rank} {r.symbol} | Score: {r.composite_score:.2%} | Target: ₹{r.target_price}")
-
-    print(f"\n🔴 Top SELL picks:")
-    for r in top_sells:
-        print(f"  #{r.rank} {r.symbol} | Score: {r.composite_score:.2%}")
-
-    # Persist predictions to DB
-    import asyncio as _asyncio
-    _asyncio.run(_persist_predictions(all_preds))
-
-
-async def _persist_predictions(predictions):
-    from src.database.models import AsyncSessionFactory, Stock, Prediction
-    from sqlalchemy import select
-    async with AsyncSessionFactory() as db:
-        for p in predictions:
-            stock_res = await db.execute(select(Stock).where(Stock.symbol == p["symbol"]))
-            stock = stock_res.scalar_one_or_none()
-            if not stock:
-                stock = Stock(symbol=p["symbol"], company_name=p["symbol"])
-                db.add(stock)
-                await db.flush()
-            pred = Prediction(
-                stock_id          = stock.id,
-                model_version     = "1.0.0",
-                signal            = p["signal"],
-                confidence        = p["confidence"],
-                composite_score   = p["composite_score"],
-                technical_score   = p["technical_score"],
-                fundamental_score = p["fundamental_score"],
-                sentiment_score   = p["sentiment_score"],
-                target_price      = p.get("target_price"),
-                stop_loss         = p.get("stop_loss"),
-                risk_reward_ratio = p.get("risk_reward_ratio"),
-                predicted_return_1d = p.get("predicted_return_5d"),
-                feature_importance  = p.get("feature_importance"),
-            )
-            db.add(pred)
-        await db.commit()
+    summary = asyncio.run(run_universe_scan(on_progress=_log_progress))
+    print(f"\n✅ Universe scan complete: {summary}")
 
 
 with DAG(
     dag_id       = "daily_prediction_pipeline",
-    description  = "Run ML ensemble predictions for all watchlist stocks",
+    description  = "Run ML ensemble predictions for the full NSE universe (equities + F&O + indices)",
     schedule     = "0 10 * * 1-5",   # 10 AM IST weekdays
     start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
@@ -200,50 +141,25 @@ with DAG(
 # DAG 3: Weekly Model Retraining
 # ════════════════════════════════════════════════════════════════════════════
 def retrain_models(**ctx):
-    """Retrain LSTM + XGBoost + LightGBM for each symbol."""
-    from config.settings import settings
-    from src.ingestion.data_fetcher import YFinanceFetcher
-    from src.features.technical import TechnicalFeatures, FeaturePipeline
-    from src.models.lstm.model import LSTMTrainer
-    from src.models.xgboost_model.model import XGBoostModel, LightGBMModel
-    from sklearn.model_selection import train_test_split
+    """
+    Retrain the shared cross-sectional XGBoost + LightGBM model (see
+    src/pipelines/train_global_model.py) on a fresh, broad sample of NSE
+    stocks — this is the model every symbol's prediction actually uses
+    (ModelOrchestrator falls back to it whenever no per-symbol model file
+    exists, which today is every symbol; see src/models/ensemble/predictor.py).
 
-    yf  = YFinanceFetcher()
-    tf  = TechnicalFeatures()
-    fp  = FeaturePipeline()
+    This DAG used to loop settings.watchlist_nse (20 hardcoded large-caps)
+    training one LSTM+XGBoost+LightGBM per symbol — impractical to extend to
+    the full ~2,300-symbol universe, and in practice models_store/ never
+    ended up with anything in it. A single cross-sectional model that pools
+    data across many symbols is the standard approach for broad-coverage
+    equity models and is what actually gets used at inference time now.
+    """
+    import asyncio
+    from src.pipelines.train_global_model import train
 
-    for sym in settings.watchlist_nse:
-        sym_clean = sym.replace(".NS", "")
-        print(f"🔄 Retraining models for {sym}…")
-        try:
-            ohlcv    = yf.fetch_ohlcv(sym, period="5y")
-            if len(ohlcv) < settings.min_training_samples:
-                print(f"  ⚠️  Not enough data ({len(ohlcv)} rows), skipping")
-                continue
-
-            enriched = tf.compute(ohlcv)
-            fund     = yf.fetch_fundamentals(sym)
-
-            # LSTM
-            X_seq, y_seq, scaler, feats = fp.prepare_lstm_input(enriched, lookback=settings.lstm_lookback)
-            split = int(0.8 * len(X_seq))
-            lstm_trainer = LSTMTrainer()
-            result = lstm_trainer.train(X_seq[:split], y_seq[:split], X_seq[split:], y_seq[split:], sym_clean)
-            print(f"  LSTM: {result.get('metrics', {})}")
-
-            # XGBoost
-            X_tab, y_tab, _, _ = fp.prepare_xgboost_input(enriched, fund)
-            xgb = XGBoostModel()
-            result_xgb = xgb.train_with_hpo(X_tab, y_tab, sym_clean, n_trials=30)
-            print(f"  XGB:  {result_xgb.get('metrics', {})}")
-
-            # LightGBM
-            lgbm = LightGBMModel()
-            result_lgbm = lgbm.train(X_tab, y_tab, sym_clean)
-            print(f"  LGBM: {result_lgbm.get('metrics', {})}")
-
-        except Exception as exc:
-            print(f"  ❌ Retraining failed for {sym}: {exc}")
+    summary = asyncio.run(train(sample_size=500, workers=8))
+    print(f"✅ Global model retrained: {summary}")
 
 
 with DAG(

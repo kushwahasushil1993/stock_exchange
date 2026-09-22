@@ -9,7 +9,7 @@ Feature Engineering Pipeline:
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -291,7 +291,13 @@ class FeaturePipeline:
 
     XGBOOST_FEATURES = LSTM_FEATURES + [
         "roc_5", "roc_10", "roc_20",
-        "williams_r", "stoch_k",
+        # stoch_k is NOT re-listed here — it's already inherited from
+        # LSTM_FEATURES above. Re-adding it used to produce two identically-
+        # named "stoch_k" columns in the feature matrix, which both XGBoost
+        # and LightGBM reject outright ("feature_names must be unique") —
+        # meaning every attempt to actually train either model on this
+        # feature set failed immediately, unconditionally, for every symbol.
+        "williams_r",
         "gap_up", "gap_down",
         "candle_body", "upper_shadow", "lower_shadow",
         "golden_cross", "macd_crossover",
@@ -344,32 +350,70 @@ class FeaturePipeline:
         Prepare tabular features for XGBoost/LightGBM.
         Target = 1 if 5-day forward return > 2%, 0 otherwise.
         """
-        from sklearn.preprocessing import StandardScaler
-
         data = df.copy()
 
-        # Inject scalar features
-        if fundamental:
-            for k, v in fundamental.items():
-                if k in self.XGBOOST_FEATURES:
-                    data[k] = v
-        if sentiment is not None:
-            data["sentiment_score"] = sentiment
-        if macro:
-            for k, v in macro.items():
-                data[k] = v
-
-        # Forward return target
+        # Target first, dropna on technical + target ONLY, before injecting
+        # the scalar fundamental/macro columns below. Those scalars broadcast
+        # one value across every historical row for this symbol — if any
+        # single one is missing (common: Yahoo has no "beta" for plenty of
+        # small/mid-caps) and dropna() ran across the combined frame, that
+        # one all-NaN column would silently wipe out EVERY row for the whole
+        # symbol, collapsing X to 0 rows. That used to happen invisibly:
+        # callers just saw an empty X, treated it as "no data", and fell
+        # through to the neutral 0.5 placeholder — for any symbol missing
+        # even one fundamental field, not just ones truly short on history.
         data["fwd_return"] = data["Close"].pct_change(horizon).shift(-horizon)
         data["target"] = (data["fwd_return"] > 0.02).astype(int)
+        tech_features = [f for f in self.XGBOOST_FEATURES if f in data.columns]
+        data = data[tech_features + ["target"]].dropna()
+
+        # Inject scalar features — always as a properly-typed float column,
+        # for every field XGBOOST_FEATURES expects, even when this symbol
+        # has no value for it (np.nan, not left absent, and not the bare
+        # Python `None`: `data[k] = None` makes pandas infer an object-dtype
+        # column, which LightGBM rejects outright — "pandas dtypes must be
+        # int, float or bool" — and skipping the column entirely would shift
+        # every later feature out of position for XGBoost's positional
+        # (.values) inference path). Emitting the same full column set on
+        # every call, training and inference alike, keeps every row's
+        # feature alignment identical regardless of which scalar values
+        # happen to be available for a given symbol. XGBoost/LightGBM's
+        # hist-based tree building treats NaN as a legitimate "missing"
+        # split value natively, so no imputation is needed either.
+        scalar_sources: Dict[str, Any] = {}
+        if fundamental:
+            scalar_sources.update(fundamental)
+        if sentiment is not None:
+            scalar_sources["sentiment_score"] = sentiment
+        if macro:
+            scalar_sources.update(macro)
+
+        SCALAR_FEATURES = [
+            "pe_ratio", "pb_ratio", "roe", "debt_to_equity",
+            "revenue_growth_yoy", "profit_margin", "beta",
+            "sentiment_score",
+            "usd_inr_ret", "gold_ret", "crude_ret", "vix",
+        ]
+        for k in SCALAR_FEATURES:
+            if k not in self.XGBOOST_FEATURES or k in data.columns:
+                continue
+            v = scalar_sources.get(k)
+            try:
+                data[k] = float(v) if v is not None else np.nan
+            except (TypeError, ValueError):
+                data[k] = np.nan
 
         features = [f for f in self.XGBOOST_FEATURES if f in data.columns]
-        data = data[features + ["target"]].dropna()
-
         X = data[features]
         y = data["target"]
 
-        scaler = StandardScaler()
-        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=features, index=X.index)
+        # Tree models don't need feature scaling (invariant to any monotonic
+        # per-feature transform) — returning raw X keeps train and inference
+        # using the exact same untransformed values, and avoids re-fitting a
+        # StandardScaler on whatever single row is being scored at inference
+        # time (which the old code did, and which especially breaks for a
+        # single-row inference call since a 1-row fit has zero variance).
+        scaler = None
+        X_scaled = X
 
         return X_scaled, y, scaler, features
