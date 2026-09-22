@@ -32,6 +32,30 @@ services:
     networks:
       - financeai-net
 
+  # React frontend — a separate project (../../../financeai-web, sibling to
+  # this repo, not a subdirectory of it), containerized here so the whole
+  # stack comes up with one `docker compose up`. Vite bakes VITE_* into the
+  # static bundle at build time (not read at container-run time like a
+  # backend env var) — these point at host-mapped ports because the
+  # *browser*, not this container, makes the calls, so compose-internal
+  # hostnames (api:8000) wouldn't resolve for it.
+  web:
+    build:
+      context: ../../../financeai-web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8000/api/v1
+        VITE_GRAFANA_URL: http://localhost:3001
+        VITE_PROMETHEUS_URL: http://localhost:9090
+    container_name: financeai-web
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - financeai-net
+
   # ─── Databases ────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
