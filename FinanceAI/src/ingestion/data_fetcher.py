@@ -208,6 +208,11 @@ class NSEFetcher:
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.nseindia.com/",
     }
+    # None of these calls had an explicit timeout — a stale/bot-detected
+    # cookie can make NSE's server hold the connection open without ever
+    # responding, rather than rejecting quickly, so this was an unbounded
+    # hang (aiohttp's own default is 300s) instead of a clean failure.
+    TIMEOUT = aiohttp.ClientTimeout(total=12)
 
     async def _get_session_cookie(self, session: aiohttp.ClientSession) -> str:
         """
@@ -221,7 +226,7 @@ class NSEFetcher:
         """
         if settings.nse_cookie:
             return settings.nse_cookie
-        async with session.get(self.BASE_URL, headers=self.HEADERS) as resp:
+        async with session.get(self.BASE_URL, headers=self.HEADERS, timeout=self.TIMEOUT) as resp:
             cookies = {k: v.value for k, v in resp.cookies.items()}
             return "; ".join([f"{k}={v}" for k, v in cookies.items()])
 
@@ -230,7 +235,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}
@@ -241,7 +246,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}
@@ -251,7 +256,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}
@@ -261,7 +266,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}

@@ -4,6 +4,7 @@ code), it fetches fresh data, checks the news, runs the prediction engine,
 and answers "buy or not" directly. Unlike /predictions/top-picks (reads
 already-computed rows from the DB), everything here runs live per request.
 """
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -179,10 +180,87 @@ class StockAnalysisOut(BaseModel):
     predicted_at: str
 
 
+def _nse_chain_to_analyzer_shape(nse_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    NSE's option-chain-equities API returns its own JSON schema (records.data
+    -> list of {strikePrice, CE: {...}, PE: {...}}) — translate it into the
+    {"calls": [...], "puts": [...], "expiry": ...} shape FNOAnalyzer expects
+    (modeled on yfinance's option_chain() DataFrame columns: strike,
+    openInterest, impliedVolatility as a 0-1 fraction — NSE reports IV as a
+    0-100 percentage, so it's divided down to match).
+    """
+    records = nse_json.get("records", {}) or {}
+    data = records.get("data", []) or []
+    calls, puts = [], []
+    for row in data:
+        strike = row.get("strikePrice")
+        ce, pe = row.get("CE"), row.get("PE")
+        if ce:
+            calls.append({
+                "strike": strike,
+                "openInterest": ce.get("openInterest", 0) or 0,
+                "impliedVolatility": (ce.get("impliedVolatility") or 0) / 100,
+            })
+        if pe:
+            puts.append({
+                "strike": strike,
+                "openInterest": pe.get("openInterest", 0) or 0,
+                "impliedVolatility": (pe.get("impliedVolatility") or 0) / 100,
+            })
+    expiry_dates = records.get("expiryDates") or []
+    return {"calls": calls, "puts": puts, "expiry": expiry_dates[0] if expiry_dates else None}
+
+
+async def _fetch_real_option_chain(symbol_clean: str, yf_symbol: str) -> Dict[str, Any]:
+    """
+    Best-effort real option chain + OI data, in order:
+      1. NSE's live API — needs a valid browser-captured session cookie
+         (NSE_COOKIE in .env; Akamai bot-detection blocks a plain server
+         request otherwise). Cookies expire within hours.
+      2. Yahoo Finance — costs nothing to try, but in practice Yahoo doesn't
+         publish options chain data for NSE-listed (India) equities at all,
+         so this is expected to come back empty for every Indian symbol.
+      3. Neither available — FNOAnalyzer still runs on signal + confidence
+         from our own prediction engine, just without real IV/PCR/max-pain.
+
+    Always returns {"chain": {...}, "oi": {...}, "source": "nse"|"yahoo"|"none"}
+    so callers can tell real market data from a neutral-default fallback
+    instead of presenting one as if it were the other.
+    """
+    from src.ingestion.data_fetcher import NSEFetcher, YFinanceFetcher
+
+    nse = NSEFetcher()
+    try:
+        raw_chain = await nse.fetch_option_chain(symbol_clean)
+        if raw_chain and raw_chain.get("records", {}).get("data"):
+            oi_raw = await nse.fetch_fno_oi(symbol_clean)
+            return {"chain": _nse_chain_to_analyzer_shape(raw_chain), "oi": oi_raw or {}, "source": "nse"}
+    except Exception as exc:
+        logger.warning("NSE option chain fetch failed for %s: %s", symbol_clean, exc)
+
+    try:
+        loop = asyncio.get_event_loop()
+        yf_chain = await loop.run_in_executor(None, YFinanceFetcher().fetch_options_chain, yf_symbol)
+        if yf_chain:
+            return {"chain": yf_chain, "oi": {}, "source": "yahoo"}
+    except Exception as exc:
+        logger.warning("Yahoo option chain fetch failed for %s: %s", symbol_clean, exc)
+
+    return {"chain": {}, "oi": {}, "source": "none"}
+
+
 class FNOAnalysisOut(StockAnalysisOut):
     fno_strategy: str
     fno_risk_level: str
     fno_rationale: str
+    strike_price: Optional[float]
+    option_type: Optional[str]
+    expiry: Optional[str]
+    iv: Optional[float]
+    pcr: float
+    oi_change_pct: float
+    max_pain: Optional[float]
+    option_data_source: str  # "nse" | "yahoo" | "none" — see _fetch_real_option_chain
 
 
 class MutualFundAnalysisOut(BaseModel):
@@ -286,7 +364,12 @@ async def analyze_fno(
     query: str = Query(..., description="Ticker or company name — must be F&O-eligible"),
     _user: User = Depends(get_current_user),
 ):
-    """Same as /analyze/stock, plus a derived F&O (futures/options) strategy."""
+    """
+    Same as /analyze/stock, plus a derived F&O (futures/options) strategy —
+    using real option chain data (strike-level OI/IV, PCR, max pain) when
+    it's actually available (see _fetch_real_option_chain), not silently
+    substituted neutral defaults presented as if they were real.
+    """
     from src.recommendation.engine import FNOAnalyzer
 
     fno_universe = await _get_fno_universe()
@@ -297,12 +380,25 @@ async def analyze_fno(
             detail=f"{result['symbol']} is not F&O-eligible on NSE (use /analyze/stock instead)",
         )
 
-    fno_rec = FNOAnalyzer().analyze(result["symbol"], result["_pred"], option_chain={}, oi_data={})
+    symbol_clean = result["symbol"].replace(".NS", "")
+    option_data = await _fetch_real_option_chain(symbol_clean, result["symbol"])
+
+    fno_rec = FNOAnalyzer().analyze(
+        result["symbol"], result["_pred"], option_data["chain"], option_data["oi"],
+    )
     return FNOAnalysisOut(
         **_strip_internal(result),
         fno_strategy=fno_rec.strategy,
         fno_risk_level=fno_rec.risk_level,
         fno_rationale=fno_rec.rationale,
+        strike_price=fno_rec.strike_price,
+        option_type=fno_rec.option_type,
+        expiry=fno_rec.expiry,
+        iv=fno_rec.iv,
+        pcr=fno_rec.pcr,
+        oi_change_pct=fno_rec.oi_change_pct,
+        max_pain=fno_rec.max_pain,
+        option_data_source=option_data["source"],
     )
 
 
