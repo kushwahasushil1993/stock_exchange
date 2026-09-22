@@ -143,7 +143,9 @@ services:
   # skipping it is why webserver/scheduler exit immediately with "You need
   # to initialize the database."
   airflow-init:
-    image: apache/airflow:2.10.0
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
     container_name: financeai-airflow-init
     entrypoint: /bin/bash
     command:
@@ -164,21 +166,34 @@ services:
       - financeai-net
 
   airflow-webserver:
-    image: apache/airflow:2.10.0
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
     container_name: financeai-airflow
     command: webserver
+    env_file:
+      - ../.env.docker   # scripts/airflow_tasks.py's subprocess reads config.settings,
+                         # same as the api service — the DAG tasks need WHATSAPP_*,
+                         # NEWSAPI_KEY, etc. from here, not just the AIRFLOW__* vars below.
     environment:
       AIRFLOW__CORE__EXECUTOR:               LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:   postgresql+psycopg2://finai:finai@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES:          "false"
       AIRFLOW__WEBSERVER__SECRET_KEY:        financeai-airflow-secret
       PYTHONPATH:                            /app
+      # .env.docker's own POSTGRES_URL/REDIS_URL/INFLUX_URL point at
+      # localhost (for non-Docker local runs) — override with the
+      # docker-internal service hostnames, same as the api service does.
+      POSTGRES_URL:                          postgresql+asyncpg://finai:finai@postgres:5432/financeai
+      REDIS_URL:                              redis://redis:6379/0
+      INFLUX_URL:                            http://influxdb:8086
     ports:
       - "8080:8080"
     volumes:
       - ../dags:/opt/airflow/dags
       - ../src:/app/src
       - ../config:/app/config
+      - ../scripts:/app/scripts
       - ../models_store:/app/models_store
       - airflow_logs:/opt/airflow/logs
     depends_on:
@@ -188,17 +203,30 @@ services:
       - financeai-net
 
   airflow-scheduler:
-    image: apache/airflow:2.10.0
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
     container_name: financeai-scheduler
     command: scheduler
+    env_file:
+      - ../.env.docker   # scripts/airflow_tasks.py's subprocess reads config.settings,
+                         # same as the api service — the DAG tasks need WHATSAPP_*,
+                         # NEWSAPI_KEY, etc. from here, not just the AIRFLOW__* vars below.
     environment:
       AIRFLOW__CORE__EXECUTOR:               LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:   postgresql+psycopg2://finai:finai@postgres:5432/airflow
       PYTHONPATH:                            /app
+      # .env.docker's own POSTGRES_URL/REDIS_URL/INFLUX_URL point at
+      # localhost (for non-Docker local runs) — override with the
+      # docker-internal service hostnames, same as the api service does.
+      POSTGRES_URL:                          postgresql+asyncpg://finai:finai@postgres:5432/financeai
+      REDIS_URL:                              redis://redis:6379/0
+      INFLUX_URL:                            http://influxdb:8086
     volumes:
       - ../dags:/opt/airflow/dags
       - ../src:/app/src
       - ../config:/app/config
+      - ../scripts:/app/scripts
       - ../models_store:/app/models_store
       - airflow_logs:/opt/airflow/logs
     depends_on:

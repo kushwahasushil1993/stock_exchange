@@ -1,10 +1,20 @@
 """
 Apache Airflow DAGs:
   1. daily_market_data_ingestion  — fetch OHLCV + news + macros
-  2. model_retraining_pipeline    — retrain all models weekly
-  3. daily_prediction_pipeline    — run predictions for all watchlist symbols
-  4. mf_data_refresh              — refresh MF NAVs daily
+  2. daily_prediction_pipeline    — full-universe predictions, then WhatsApp notify
+  3. weekly_model_retraining      — retrain the shared cross-sectional model
+
+Every task here is a thin subprocess wrapper — see scripts/airflow_tasks.py
+for what each one actually does. They can't just `import src.pipelines...`
+directly into Airflow's own interpreter: Airflow 2.10's bundled environment
+pins sqlalchemy==1.4.x (this project's src/database/models.py uses
+SQLAlchemy 2.0's async ORM API, which doesn't exist in 1.4) and is missing
+xgboost/tensorflow/yfinance/etc. entirely. docker/Dockerfile.airflow builds
+a separate venv at /opt/finai-venv with this project's actual
+requirements.txt installed, and every task below runs against THAT
+interpreter as a subprocess instead.
 """
+import subprocess
 from datetime import timedelta
 
 import pendulum
@@ -30,54 +40,26 @@ DEFAULT_ARGS = {
     # airflow.providers.smtp.notifications.smtp.SmtpNotifier.
 }
 
+FINAI_VENV_PYTHON = "/opt/finai-venv/bin/python"
+AIRFLOW_TASKS_SCRIPT = "/app/scripts/airflow_tasks.py"
+
+
+def _run_finai_task(task_name: str) -> None:
+    """
+    Runs one scripts/airflow_tasks.py task against /opt/finai-venv, streaming
+    its stdout/stderr straight into this Airflow task's own log and raising
+    (failing the task, triggering DEFAULT_ARGS' retry) on a non-zero exit.
+    """
+    subprocess.run(
+        [FINAI_VENV_PYTHON, AIRFLOW_TASKS_SCRIPT, task_name],
+        cwd="/app",
+        check=True,
+    )
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # DAG 1: Daily Market Data Ingestion
 # ════════════════════════════════════════════════════════════════════════════
-def ingest_ohlcv(**ctx):
-    from src.ingestion.data_fetcher import YFinanceFetcher
-    from config.settings import settings
-    import pandas as pd
-    from pathlib import Path
-
-    fetcher = YFinanceFetcher()
-    data    = fetcher.fetch_multiple(settings.watchlist_nse, period="5d", interval="1d")
-    Path("data/raw").mkdir(parents=True, exist_ok=True)
-    for sym, df in data.items():
-        df.to_parquet(f"data/raw/{sym.replace('.', '_')}_ohlcv.parquet")
-    print(f"✅ Ingested OHLCV for {len(data)} symbols")
-
-
-def ingest_news(**ctx):
-    import asyncio
-    from src.ingestion.data_fetcher import NewsFetcher
-    from src.sentiment.analyzer import NewsAggregator
-    from config.settings import settings
-    import json, time
-    from pathlib import Path
-
-    async def _run():
-        fetcher = NewsFetcher()
-        articles = await fetcher.fetch_all(settings.watchlist_nse)
-        agg  = NewsAggregator()
-        enriched = agg.process_articles(articles)
-        Path("data/raw").mkdir(parents=True, exist_ok=True)
-        fname = f"data/raw/news_{int(time.time())}.json"
-        with open(fname, "w") as f:
-            json.dump(enriched, f, default=str)
-        return len(enriched)
-
-    count = asyncio.run(_run())
-    print(f"✅ Ingested {count} news articles")
-
-
-def ingest_macro(**ctx):
-    from src.ingestion.data_fetcher import MacroFetcher
-    macro = MacroFetcher()
-    data  = macro.fetch_all(period="5d")
-    print(f"✅ Ingested macro data for {len(data)} indicators")
-
-
 with DAG(
     dag_id      = "daily_market_data_ingestion",
     description = "Fetch OHLCV, news, and macro data",
@@ -88,9 +70,9 @@ with DAG(
     tags        = ["ingestion", "market-data"],
 ) as dag1:
 
-    t_ohlcv = PythonOperator(task_id="ingest_ohlcv", python_callable=ingest_ohlcv)
-    t_news  = PythonOperator(task_id="ingest_news",  python_callable=ingest_news)
-    t_macro = PythonOperator(task_id="ingest_macro", python_callable=ingest_macro)
+    t_ohlcv = PythonOperator(task_id="ingest_ohlcv", python_callable=lambda **ctx: _run_finai_task("ingest_ohlcv"))
+    t_news  = PythonOperator(task_id="ingest_news",  python_callable=lambda **ctx: _run_finai_task("ingest_news"))
+    t_macro = PythonOperator(task_id="ingest_macro", python_callable=lambda **ctx: _run_finai_task("ingest_macro"))
 
     [t_ohlcv, t_news, t_macro]  # Parallel
 
@@ -98,35 +80,9 @@ with DAG(
 # ════════════════════════════════════════════════════════════════════════════
 # DAG 2: Daily Prediction Pipeline
 # ════════════════════════════════════════════════════════════════════════════
-def run_predictions(**ctx):
-    """
-    Run ensemble predictions for the FULL NSE universe (~2,300 equities +
-    F&O + index F&O) — not just settings.watchlist_nse (20 hardcoded
-    large-caps). That 20-symbol list is what this task used to scan, which
-    is why the vast majority of NSE-listed stocks (small/mid-caps included —
-    e.g. Optiemus Infracom) never showed up anywhere in the app, and why
-    predictions looked repetitive day to day: the same tiny, static set was
-    the only thing ever refreshed on a schedule.
-
-    src.pipelines.universe_scan.run_universe_scan() is the real, full-
-    coverage pipeline (also used by POST /api/v1/predictions/run-universe
-    and scripts/run_full_universe_pipeline.py) — it fetches the live NSE
-    equity + F&O + index lists itself, so this task doesn't need (and
-    shouldn't hardcode) a symbol list at all.
-    """
-    import asyncio
-    from src.pipelines.universe_scan import run_universe_scan
-
-    def _log_progress(event: dict):
-        print(f"  {event}")
-
-    summary = asyncio.run(run_universe_scan(on_progress=_log_progress))
-    print(f"\n✅ Universe scan complete: {summary}")
-
-
 with DAG(
     dag_id       = "daily_prediction_pipeline",
-    description  = "Run ML ensemble predictions for the full NSE universe (equities + F&O + indices)",
+    description  = "Run ML ensemble predictions for the full NSE universe (equities + F&O + indices), then notify via WhatsApp",
     schedule     = "0 10 * * 1-5",   # 10 AM IST weekdays
     start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
@@ -134,37 +90,17 @@ with DAG(
     tags         = ["predictions", "ml"],
 ) as dag2:
 
-    PythonOperator(task_id="run_predictions", python_callable=run_predictions)
+    t_predict = PythonOperator(task_id="run_predictions", python_callable=lambda **ctx: _run_finai_task("run_predictions"))
+    t_notify  = PythonOperator(task_id="notify_whatsapp", python_callable=lambda **ctx: _run_finai_task("notify_whatsapp"))
+    t_predict >> t_notify
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # DAG 3: Weekly Model Retraining
 # ════════════════════════════════════════════════════════════════════════════
-def retrain_models(**ctx):
-    """
-    Retrain the shared cross-sectional XGBoost + LightGBM model (see
-    src/pipelines/train_global_model.py) on a fresh, broad sample of NSE
-    stocks — this is the model every symbol's prediction actually uses
-    (ModelOrchestrator falls back to it whenever no per-symbol model file
-    exists, which today is every symbol; see src/models/ensemble/predictor.py).
-
-    This DAG used to loop settings.watchlist_nse (20 hardcoded large-caps)
-    training one LSTM+XGBoost+LightGBM per symbol — impractical to extend to
-    the full ~2,300-symbol universe, and in practice models_store/ never
-    ended up with anything in it. A single cross-sectional model that pools
-    data across many symbols is the standard approach for broad-coverage
-    equity models and is what actually gets used at inference time now.
-    """
-    import asyncio
-    from src.pipelines.train_global_model import train
-
-    summary = asyncio.run(train(sample_size=500, workers=8))
-    print(f"✅ Global model retrained: {summary}")
-
-
 with DAG(
     dag_id       = "weekly_model_retraining",
-    description  = "Retrain all ML models on fresh data",
+    description  = "Retrain the shared cross-sectional XGBoost + LightGBM model on fresh data",
     schedule     = "0 2 * * 0",   # Sunday 2 AM UTC
     start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
@@ -172,4 +108,4 @@ with DAG(
     tags         = ["training", "ml"],
 ) as dag3:
 
-    PythonOperator(task_id="retrain_models", python_callable=retrain_models)
+    PythonOperator(task_id="retrain_models", python_callable=lambda **ctx: _run_finai_task("retrain_models"))
