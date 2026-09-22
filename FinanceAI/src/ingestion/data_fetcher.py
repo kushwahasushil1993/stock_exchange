@@ -117,6 +117,30 @@ class YFinanceFetcher:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Index F&O — NIFTY/BANKNIFTY/etc. are the single most-traded F&O
+# instruments in India, but NSEUniverseFetcher.fetch_fno_symbols() excludes
+# them (they're derivatives, not equities — no "Stock" the way a company
+# is). Kept as a small separate registry rather than folded into the
+# equity/F&O symbol lists, since each entry needs its own yfinance ticker
+# (indices aren't ".NS"-suffixable the way stocks are) and has no
+# fundamentals (no PE ratio, no sector). Every ticker below was verified
+# directly against yfinance's own metadata (Ticker(...).info["longName"]),
+# not guessed from the symbol string.
+INDEX_FNO = {
+    "NIFTY":      {"yf_symbol": "^NSEI",        "company_name": "Nifty 50"},
+    "BANKNIFTY":  {"yf_symbol": "^NSEBANK",      "company_name": "Nifty Bank"},
+    "FINNIFTY":   {"yf_symbol": "NIFTY_FIN_SERVICE.NS", "company_name": "Nifty Financial Services"},
+    "MIDCPNIFTY": {"yf_symbol": "^NSEMDCP50",    "company_name": "Nifty Midcap 50"},
+    "NIFTYNXT50": {"yf_symbol": "^NSMIDCP",      "company_name": "Nifty Next 50"},
+}
+# FINNIFTY (NIFTY_FIN_SERVICE.NS) has a live price on Yahoo but only ~1 day
+# of historical OHLCV — genuinely insufficient for the technical-indicator
+# pipeline (MIN_OHLCV_ROWS), not a fetch bug. It's included anyway and will
+# naturally fall into the same "insufficient_data" skip path every other
+# thinly-covered symbol already does, rather than special-cased out.
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # NSE Universe Fetcher — full listed-equity / F&O-eligible symbol lists
 # ════════════════════════════════════════════════════════════════════════════
 class NSEUniverseFetcher:

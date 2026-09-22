@@ -40,14 +40,16 @@ async def _get_equity_universe() -> List[Dict[str, str]]:
 async def _get_fno_universe() -> set:
     import json
 
+    from src.ingestion.data_fetcher import INDEX_FNO
+
     cached = await redis_cache.get(_FNO_CACHE_KEY)
     if cached:
-        return set(json.loads(cached))
+        return set(json.loads(cached)) | {cfg["yf_symbol"] for cfg in INDEX_FNO.values()}
 
     from src.ingestion.data_fetcher import NSEUniverseFetcher
     symbols = await NSEUniverseFetcher().fetch_fno_symbols()
     await redis_cache.set(_FNO_CACHE_KEY, json.dumps(symbols), ttl=_CACHE_TTL)
-    return set(symbols)
+    return set(symbols) | {cfg["yf_symbol"] for cfg in INDEX_FNO.values()}
 
 
 async def _get_mf_universe() -> List[Dict[str, str]]:
@@ -73,13 +75,37 @@ async def _get_mf_universe() -> List[Dict[str, str]]:
 
 async def _resolve_equity(query: str) -> Dict[str, str]:
     """
-    Accept a ticker (RELIANCE / RELIANCE.NS) or a company name (Reliance
-    Industries) and resolve it to {symbol, yf_symbol, company_name}.
+    Accept a ticker (RELIANCE / RELIANCE.NS), a company name (Reliance
+    Industries), or an index F&O name (NIFTY, Bank Nifty) and resolve it to
+    {symbol, yf_symbol, company_name}.
     """
+    from src.ingestion.data_fetcher import INDEX_FNO
+
     q = query.strip()
     q_upper = q.upper().replace(".NS", "")
-    universe = await _get_equity_universe()
 
+    if q_upper in INDEX_FNO:
+        return {"symbol": q_upper, **INDEX_FNO[q_upper]}
+    # The value stored as Stock.symbol / used in frontend links is the
+    # yf_symbol ("^NSEI", or "NIFTY_FIN_SERVICE.NS" for FINNIFTY) — a query
+    # of that exact value (from clicking a symbol link) needs to match here
+    # too. Compared against the un-stripped query — q_upper already had
+    # ".NS" removed above, which would wrongly break FINNIFTY's yf_symbol
+    # (the only one of the 5 actually shaped like a regular ".NS" ticker).
+    q_raw_upper = q.upper()
+    for key, cfg in INDEX_FNO.items():
+        if q_raw_upper == cfg["yf_symbol"].upper():
+            return {"symbol": key, **cfg}
+    # Word-set match, not substring — "Bank Nifty" (the common colloquial
+    # order) wouldn't otherwise match "Nifty Bank" (Yahoo's official name
+    # order); comparing word sets is order-independent.
+    q_words = set(q.lower().split())
+    for key, cfg in INDEX_FNO.items():
+        cfg_words = set(cfg["company_name"].lower().split())
+        if q_words and q_words.issubset(cfg_words):
+            return {"symbol": key, **cfg}
+
+    universe = await _get_equity_universe()
     for e in universe:
         if e["symbol"] == q_upper:
             return e
@@ -87,7 +113,7 @@ async def _resolve_equity(query: str) -> Dict[str, str]:
         if q.lower() in e["company_name"].lower():
             return e
 
-    raise HTTPException(status_code=404, detail=f"No NSE-listed equity matching '{query}'")
+    raise HTTPException(status_code=404, detail=f"No NSE-listed equity or index matching '{query}'")
 
 
 # ─── Shared stock analysis ───────────────────────────────────────────────────
@@ -99,10 +125,27 @@ async def _analyze_equity(query: str) -> Dict[str, Any]:
     match = await _resolve_equity(query)
     yf_symbol = match["yf_symbol"]
 
+    from src.pipelines.universe_scan import MIN_OHLCV_ROWS
+
     yf = YFinanceFetcher()
     ohlcv = yf.fetch_ohlcv(yf_symbol, period="5y")
     if ohlcv.empty:
         raise HTTPException(status_code=404, detail=f"No price data available for {yf_symbol}")
+    if len(ohlcv) < MIN_OHLCV_ROWS:
+        # Same threshold the universe scan uses to skip a symbol outright
+        # (src/pipelines/universe_scan.py) — below this, technical indicators
+        # compute as NaN, which the prediction model then propagates through
+        # rather than raising, and NaN isn't valid JSON (crashes the response
+        # with a 500 instead of a clean error). Confirmed hit by FINNIFTY
+        # (NIFTY_FIN_SERVICE.NS), which Yahoo has only ~1 row of history for.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Insufficient price history for {yf_symbol} "
+                f"({len(ohlcv)} rows, need at least {MIN_OHLCV_ROWS}) — "
+                "prediction requires more data than is currently available."
+            ),
+        )
     fund = yf.fetch_fundamentals(yf_symbol)
 
     # News: search by company name directly rather than the existing
@@ -307,8 +350,18 @@ async def suggest(
     if asset_type in ("stock", "fno"):
         universe = await _get_equity_universe()
         if asset_type == "fno":
+            from src.ingestion.data_fetcher import INDEX_FNO
+
             fno_symbols = await _get_fno_universe()
             universe = [e for e in universe if e["yf_symbol"] in fno_symbols]
+            # Index F&O aren't in the equity universe at all (they're
+            # derivatives, not SERIES=='EQ' listings) — add them as
+            # candidates directly so NIFTY/BANKNIFTY/etc. actually show up
+            # in the F&O tab's autocomplete.
+            universe = universe + [
+                {"symbol": key, "yf_symbol": cfg["yf_symbol"], "company_name": cfg["company_name"]}
+                for key, cfg in INDEX_FNO.items()
+            ]
 
         matches = [
             e for e in universe

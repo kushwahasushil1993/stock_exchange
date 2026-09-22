@@ -37,7 +37,7 @@ from src.database.models import (
     init_db,
     redis_cache,
 )
-from src.ingestion.data_fetcher import NSEUniverseFetcher, YFinanceFetcher
+from src.ingestion.data_fetcher import INDEX_FNO, NSEUniverseFetcher, YFinanceFetcher
 from src.models.ensemble.predictor import ModelOrchestrator
 from src.recommendation.engine import FNOAnalyzer
 
@@ -305,6 +305,15 @@ async def run_universe_scan(
             symbols = [s for s in symbols if s in fno_symbols]
         if limit:
             symbols = symbols[:limit]
+
+        # Index F&O (NIFTY, BANKNIFTY, ...) — NSE's most-traded derivatives
+        # by far, but not "equities" in NSEUniverseFetcher's SERIES=='EQ'
+        # sense, so they'd otherwise never appear anywhere. Always included
+        # (they're inherently F&O-only, regardless of the universe= filter)
+        # and not subject to --limit, since it's a fixed set of 5.
+        index_symbols = [cfg["yf_symbol"] for cfg in INDEX_FNO.values()]
+        fno_symbols = fno_symbols | set(index_symbols)
+        symbols = symbols + index_symbols
         total = len(symbols)
 
         if on_progress:
