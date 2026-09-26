@@ -58,6 +58,20 @@ def decide(
         negative.append(f"expected return ({expected_return:.2%}) too small to be meaningful")
         return Decision(DecisionType.NO_CLEAR_SIGNAL, positive, negative)
 
+    # Model A (direction) and Model B (expected return) are trained
+    # separately and can disagree — found by building the portfolio
+    # backtest, which fed real predictions through this function and
+    # produced trades reading "POSITIVE_DIRECTIONAL_SETUP" with a NEGATIVE
+    # expected_return. Two models pointing opposite directions is exactly
+    # the kind of unclear evidence this function exists to catch, not
+    # something to paper over by only checking Model A's edge.
+    if (edge > 0) != (expected_return > 0):
+        negative.append(
+            f"Model A and Model B disagree on direction (probability favors "
+            f"{'UP' if edge > 0 else 'DOWN'}, expected return is {expected_return:.2%})"
+        )
+        return Decision(DecisionType.NO_CLEAR_SIGNAL, positive, negative)
+
     if risk_level == RiskLevel.HIGH_RISK and liquidity_level in DISQUALIFYING_RISK_LIQUIDITY:
         negative.append(f"high risk combined with {liquidity_level.value.lower()} liquidity")
         return Decision(DecisionType.NO_CLEAR_SIGNAL, positive, negative)
