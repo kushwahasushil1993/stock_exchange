@@ -46,6 +46,7 @@ class ThreeModelOrchestrator:
         ohlcv_df: pd.DataFrame,
         nifty_df: Optional[pd.DataFrame] = None,
         sensex_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
         market_regime: Optional[MarketRegime] = None,
     ) -> Dict:
         """
@@ -68,6 +69,10 @@ class ThreeModelOrchestrator:
         enriched = TechnicalFeatures().compute(ohlcv_df)
         enriched = add_index_relative_features(enriched, nifty_df, "nifty")
         enriched = add_index_relative_features(enriched, sensex_df, "sensex")
+        # sector_df is None whenever this stock's sector has no real NSE
+        # index mapping (see src/market/sector_index.py) or hasn't been
+        # scanned yet — add_index_relative_features no-ops safely on None.
+        enriched = add_index_relative_features(enriched, sector_df, "sector")
 
         fp = FeaturePipeline()
         X, _y, _scaler, _features, _fwd = fp.prepare_xgboost_input(

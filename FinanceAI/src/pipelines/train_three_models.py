@@ -55,7 +55,7 @@ HORIZON_DAYS = 1  # next-session direction/return, per §22 — not the old 5-da
 FLAT_THRESHOLD = 0.002  # +/-0.2% dead zone around zero — see prepare_xgboost_input's direction_classes=3
 FOLD_MONTHS = 6  # expanding-window fold length
 
-FEATURE_VERSION = "v5_swing_structure_features"
+FEATURE_VERSION = "v6_sector_relative_strength"
 
 # Excludes every fundamental field from XGBOOST_FEATURES — see this file's
 # module docstring for why. Everything else (technical + whatever market-
@@ -88,19 +88,46 @@ def _load_symbol_history(symbol: str) -> Optional[pd.DataFrame]:
     return df.set_index("Date")
 
 
-def _build_symbol_features(symbol: str) -> Optional[pd.DataFrame]:
+def _load_symbol_sector(symbol: str) -> Optional[str]:
+    """Sync (runs in a worker thread) — this symbol's Stock.sector, via the same sync engine pattern as _load_symbol_history."""
+    from src.pipelines.universe_scan import _get_sync_engine
+    from sqlalchemy import text
+
+    engine = _get_sync_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT sector FROM stocks WHERE symbol = :symbol"), {"symbol": symbol}).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _build_symbol_features(
+    symbol: str, sector_histories: Optional[Dict[str, pd.DataFrame]] = None,
+) -> Optional[pd.DataFrame]:
     """
     One symbol's full feature history, with `date` and `symbol` columns
     retained (needed for the walk-forward split's calendar-date cutoffs and
     for pooling), fundamentals excluded (see module docstring).
+
+    sector_histories (loaded ONCE in train(), keyed by GICS sector name —
+    see src/market/sector_index.py) is joined in via the SAME
+    add_index_relative_features() the live inference path
+    (three_model_orchestrator.py) uses, so training and inference see
+    identically-shaped sector_return/return_vs_sector/rolling_beta_sector/
+    rolling_corr_sector columns. A symbol whose sector has no real NSE
+    index mapping (e.g. Utilities) or isn't in sector_histories yet just
+    gets NaN for these — add_index_relative_features no-ops on None.
     """
     from src.features.technical import TechnicalFeatures, FeaturePipeline
+    from src.market.relative_strength import add_index_relative_features
 
     df = _load_symbol_history(symbol)
     if df is None:
         return None
     try:
         enriched = TechnicalFeatures().compute(df)
+        if sector_histories:
+            sector = _load_symbol_sector(symbol)
+            sector_df = sector_histories.get(sector) if sector else None
+            enriched = add_index_relative_features(enriched, sector_df, "sector")
         X, y, _scaler, features, fwd_return = FeaturePipeline().prepare_xgboost_input(
             enriched, fundamental=None, sentiment=None, macro=None,
             horizon=HORIZON_DAYS, direction_classes=3, flat_threshold=FLAT_THRESHOLD,
@@ -231,7 +258,20 @@ async def train(sample_size: int = 500, workers: int = 8) -> dict:
     start = time.time()
     loop = asyncio.get_event_loop()
     executor = ThreadPoolExecutor(max_workers=workers)
-    tasks = [loop.run_in_executor(executor, _build_symbol_features, sym) for sym in symbols]
+
+    # Real NSE sectoral-index history, loaded ONCE per sector (not per
+    # symbol) — see src/market/sector_index.py for the mapping and its
+    # documented, honest gaps (Utilities unmapped; 3 approximate matches).
+    from src.market.sector_index import SECTOR_INDEX_MAP
+    sector_histories: Dict[str, pd.DataFrame] = {}
+    for sector_name, cfg in SECTOR_INDEX_MAP.items():
+        hist = await loop.run_in_executor(executor, _load_symbol_history, cfg["yf_symbol"])
+        if hist is not None and not hist.empty:
+            sector_histories[sector_name] = hist
+    logger.info("Loaded sector index history for %d/%d sectors: %s",
+                len(sector_histories), len(SECTOR_INDEX_MAP), sorted(sector_histories.keys()))
+
+    tasks = [loop.run_in_executor(executor, _build_symbol_features, sym, sector_histories) for sym in symbols]
 
     parts = []
     ok = fail = 0
@@ -354,7 +394,7 @@ async def train(sample_size: int = 500, workers: int = 8) -> dict:
     from src.database.models import AsyncSessionFactory, ModelRegistry, ModelTrainingRun
     async with AsyncSessionFactory() as db:
         model_row = ModelRegistry(
-            model_name="direction_return_v5", version=f"v5_{int(time.time())}", model_type="xgboost+lightgbm",
+            model_name="direction_return_v6", version=f"v6_{int(time.time())}", model_type="xgboost+lightgbm",
             symbol=None, artifact_path=str(model_dir), feature_version=FEATURE_VERSION,
             hyperparameters={"direction": "XGBClassifier multi:softprob", "return": "LGBMRegressor quantile"},
             training_period_start=min_date.date(), training_period_end=final_train_end.date(),

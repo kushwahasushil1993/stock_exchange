@@ -377,6 +377,12 @@ class FeaturePipeline:
         "higher_highs", "lower_highs", "higher_lows", "lower_lows",
         "resistance_distance", "support_distance",
         "rsi_slope", "rsi_divergence", "macd_histogram_slope", "volume_trend",
+        # Sector context (src/market/sector_index.py) — real NSE sectoral
+        # index vs. this stock's own return, joined in by universe_scan.py/
+        # train_three_models.py before this pipeline runs. NaN (not 0) for
+        # a stock whose sector has no real index mapping (e.g. Utilities) —
+        # tree models handle NaN as a legitimate "missing" split natively.
+        "sector_return", "return_vs_sector", "rolling_beta_sector", "rolling_corr_sector",
         # Fundamental features added later
         "pe_ratio", "pb_ratio", "roe", "debt_to_equity",
         "revenue_growth_yoy", "profit_margin", "beta",

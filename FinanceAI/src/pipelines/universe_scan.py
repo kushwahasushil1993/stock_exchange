@@ -46,6 +46,7 @@ from src.database.models import (
     redis_cache,
 )
 from src.ingestion.data_fetcher import INDEX_FNO, NSEUniverseFetcher, YFinanceFetcher
+from src.market.sector_index import SECTOR_INDEX_SYMBOLS, get_sector_index_symbol
 from src.models.ensemble.predictor import ModelOrchestrator
 from src.recommendation.engine import FNOAnalyzer
 
@@ -364,8 +365,10 @@ def fetch_and_predict(symbol: str, is_fno: bool, series: Optional[str] = None) -
             try:
                 nifty_hist = _get_index_history_cached("^NSEI")
                 sensex_hist = _get_index_history_cached("^BSESN")
+                sector_symbol = get_sector_index_symbol(fund.get("sector"))
+                sector_hist = _get_index_history_cached(sector_symbol) if sector_symbol else None
                 three_model_pred = ThreeModelOrchestrator().predict(
-                    symbol, ohlcv, nifty_df=nifty_hist, sensex_df=sensex_hist,
+                    symbol, ohlcv, nifty_df=nifty_hist, sensex_df=sensex_hist, sector_df=sector_hist,
                     market_regime=_current_market_regime,
                 )
                 three_model_pred["target_trading_date"] = _current_target_trading_date
@@ -802,6 +805,13 @@ async def run_universe_scan(
         index_symbols = [cfg["yf_symbol"] for cfg in INDEX_FNO.values()]
         fno_symbols = fno_symbols | set(index_symbols)
         symbols = symbols + index_symbols
+
+        # Real NSE sectoral indices (NIFTY IT, NIFTY AUTO, ...) — needed for
+        # the sector_return/sector_relative_strength features (src/market/
+        # sector_index.py). Scanned the same way as the broad indices above
+        # so their price_history backfills and stays current automatically;
+        # not subject to --limit, same reasoning as index_symbols.
+        symbols = symbols + [s for s in SECTOR_INDEX_SYMBOLS if s not in symbols]
         total = len(symbols)
 
         warm = await asyncio.get_event_loop().run_in_executor(None, _warm_up_yfinance_session)
