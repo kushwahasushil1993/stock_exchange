@@ -691,7 +691,15 @@ async def _scan_pass(
                 else:
                     throttle.record(False)
                     ok += 1
-                    sig = result["pred"]["signal"]
+                    pred = result["pred"]
+                    if "decision" in pred:
+                        # Three-model path — decision, not signal. Same
+                        # mapping persist_result() uses, purely for the
+                        # buy/sell/hold progress tally shown while scanning.
+                        sig = {"POSITIVE_DIRECTIONAL_SETUP": "BUY", "NEGATIVE_DIRECTIONAL_SETUP": "SELL",
+                               "NO_CLEAR_SIGNAL": "HOLD"}[pred["decision"].value]
+                    else:
+                        sig = pred["signal"]
                     buy += sig == "BUY"
                     sell += sig == "SELL"
                     hold += sig == "HOLD"
@@ -898,6 +906,23 @@ async def run_universe_scan(
             "completed_at": datetime.utcnow().isoformat(),
         }
         await _set_status(**summary)
+
+        # /predictions/top-picks (the Dashboard's "Top Picks" section)
+        # caches its response for 15 minutes (predictions.py) keyed by
+        # top_n, e.g. "top_picks:10" — with no invalidation hook, so it
+        # kept serving whatever was cached from BEFORE this scan for up to
+        # 15 more minutes after fresh predictions had already landed,
+        # regardless of ok=ok/failed=0 above. Cleared here, unconditionally,
+        # so the very next request after a completed scan recomputes from
+        # the predictions this run just wrote. (mutual-fund recommendation
+        # caching is a separate data domain — an AMFI-fed pipeline this
+        # scan never touches — so it's deliberately left alone here.)
+        try:
+            cleared = await redis_cache.delete_pattern("top_picks:*")
+            logger.info("Cleared %d cached top_picks entries after scan completion", cleared)
+        except Exception as exc:
+            logger.warning("Failed to clear top_picks cache after scan: %s", exc)
+
         if on_progress:
             on_progress({"event": "completed", **summary})
         return summary

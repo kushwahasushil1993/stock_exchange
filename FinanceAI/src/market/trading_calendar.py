@@ -105,7 +105,15 @@ async def backfill_from_market_data(exchange: str = "NSE") -> int:
 
 
 async def seed_fixed_holidays(year: int, exchange: str = "NSE") -> None:
-    """Seeds this year's fixed-date holidays (see FIXED_HOLIDAYS) plus weekends, for dates not already known empirically."""
+    """
+    Seeds every date in `year`: weekends and fixed-date holidays (see
+    FIXED_HOLIDAYS) as non-trading, and every OTHER weekday as a trading
+    day. That last part matters — a version of this that only inserted
+    non-trading days left ordinary future weekdays with no calendar row at
+    all, so is_trading_day() fell through to its "no record" warning path
+    for completely normal trading days, not just the genuine lunar-holiday
+    gap this module is honest about elsewhere.
+    """
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     rows = []
@@ -119,6 +127,9 @@ async def seed_fixed_holidays(year: int, exchange: str = "NSE") -> None:
         elif (d.month, d.day) in fixed:
             rows.append({"date": d, "exchange": exchange, "is_trading_day": False,
                          "holiday_name": fixed[(d.month, d.day)], "source": "fixed_holiday"})
+        else:
+            rows.append({"date": d, "exchange": exchange, "is_trading_day": True,
+                         "holiday_name": None, "source": "assumed_trading_day"})
         d += timedelta(days=1)
 
     async with AsyncSessionFactory() as db:

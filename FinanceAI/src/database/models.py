@@ -308,7 +308,7 @@ class Prediction(Base):
     stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"), index=True)
     model_version: Mapped[str] = mapped_column(String(50))
     model_id: Mapped[Optional[int]] = mapped_column(ForeignKey("model_registry.id"))
-    feature_version: Mapped[Optional[str]] = mapped_column(String(20))
+    feature_version: Mapped[Optional[str]] = mapped_column(String(50))
     signal: Mapped[SignalType] = mapped_column(Enum(SignalType))
     confidence: Mapped[float] = mapped_column(Float)
     current_price: Mapped[Optional[float]] = mapped_column(Float)
@@ -457,7 +457,7 @@ class ModelRegistry(Base):
     model_type: Mapped[str] = mapped_column(String(50))  # lstm | xgboost | lgbm | ensemble
     symbol: Mapped[Optional[str]] = mapped_column(String(20))  # null for the pooled cross-sectional model
     artifact_path: Mapped[str] = mapped_column(String(500))
-    feature_version: Mapped[Optional[str]] = mapped_column(String(20))
+    feature_version: Mapped[Optional[str]] = mapped_column(String(50))
     hyperparameters: Mapped[Optional[dict]] = mapped_column(JSON)
     training_period_start: Mapped[Optional[datetime]] = mapped_column(Date)
     training_period_end: Mapped[Optional[datetime]] = mapped_column(Date)
@@ -589,6 +589,24 @@ class RedisCache:
 
     async def delete(self, key: str):
         await self._client.delete(key)
+
+    async def delete_pattern(self, pattern: str) -> int:
+        """
+        Deletes every key matching a glob pattern (e.g. "top_picks:*") —
+        for cache entries keyed by a parameter (top_n, symbol, ...) where
+        the exact key(s) written aren't known by the invalidating caller.
+        Uses SCAN (cursor-based), not KEYS — doesn't block Redis on a large
+        keyspace. Returns the number of keys deleted.
+        """
+        deleted = 0
+        cursor = 0
+        while True:
+            cursor, keys = await self._client.scan(cursor=cursor, match=pattern, count=500)
+            if keys:
+                deleted += await self._client.delete(*keys)
+            if cursor == 0:
+                break
+        return deleted
 
     async def close(self):
         await self._client.aclose()
