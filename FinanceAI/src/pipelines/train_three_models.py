@@ -245,12 +245,18 @@ def _baseline_metrics(fold_df: pd.DataFrame) -> Dict:
             "previous_session_momentum_accuracy": round(prev_session_acc, 4) if prev_session_acc is not None else None}
 
 
-async def train(sample_size: int = 500, workers: int = 8) -> dict:
+async def build_pooled_dataset(sample_size: int = 500, workers: int = 8):
+    """
+    Builds the pooled cross-sectional feature dataset + walk-forward fold
+    boundaries — the shared first half of train(), extracted so
+    src/pipelines/portfolio_backtest.py can work from EXACTLY the same
+    data (same symbols, same features, same fold boundaries) instead of
+    duplicating this orchestration and risking the two silently drifting
+    apart.
+
+    Returns (pool, feature_cols, folds, ok, fail).
+    """
     import asyncio
-    from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.metrics import accuracy_score, f1_score, log_loss, precision_score, recall_score
-    import xgboost as xgb
-    import lightgbm as lgb
 
     symbols = await _build_training_universe(sample_size)
     logger.info("Training universe: %d symbols (stride-sampled), reading from stored price_history", len(symbols))
@@ -300,6 +306,19 @@ async def train(sample_size: int = 500, workers: int = 8) -> dict:
                 len(pool), ok, min_date.date(), max_date.date(), len(folds))
     if not folds:
         raise RuntimeError("Not enough date range for even one walk-forward fold — need more history.")
+
+    return pool, feature_cols, folds, ok, fail
+
+
+async def train(sample_size: int = 500, workers: int = 8) -> dict:
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.metrics import accuracy_score, f1_score, log_loss, precision_score, recall_score
+    import xgboost as xgb
+    import lightgbm as lgb
+
+    start = time.time()
+    pool, feature_cols, folds, ok, fail = await build_pooled_dataset(sample_size, workers)
+    min_date, max_date = pool["date"].min(), pool["date"].max()
 
     fold_results = []
     for i, (train_end, val_start, val_end) in enumerate(folds, start=1):
