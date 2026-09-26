@@ -35,6 +35,7 @@ from config.settings import settings
 from src.database.models import (
     AssetType,
     AsyncSessionFactory,
+    DecisionType,
     Fundamental,
     FNORecommendation,
     Prediction,
@@ -320,11 +321,35 @@ def _get_ohlcv(yf: YFinanceFetcher, symbol: str) -> pd.DataFrame:
     return combined[~combined.index.duplicated(keep="last")].sort_index()
 
 
+# Set once per run_universe_scan() call, before the thread pool starts —
+# read (never mutated) by every worker thread. Avoids threading two extra
+# parameters through _scan_pass/_prioritize/the pairs-triple plumbing for
+# values that are genuinely the same for every symbol in a given run.
+_current_market_regime = None
+_current_target_trading_date = None
+_index_history_cache: Dict[str, Optional[pd.DataFrame]] = {}
+
+
+def _get_index_history_cached(symbol: str) -> Optional[pd.DataFrame]:
+    if symbol not in _index_history_cache:
+        _index_history_cache[symbol] = _load_existing_ohlcv(symbol)
+    return _index_history_cache[symbol]
+
+
 def fetch_and_predict(symbol: str, is_fno: bool, series: Optional[str] = None) -> Dict:
     """
     Runs in a worker thread — blocking yfinance calls + CPU-bound feature/model
     work. Never raises: failures come back as {"symbol": ..., "error": ...}.
+
+    Tries the three-model path (src/models/three_model_orchestrator.py —
+    calibrated direction + return regression + rule-based risk/liquidity,
+    walk-forward validated) first; falls back to the legacy single-composite
+    ModelOrchestrator if the three-model artifacts haven't been trained yet
+    or fail for this symbol, same "never crash the whole scan over one
+    model's issue" convention the rest of this pipeline follows.
     """
+    from src.market.risk_liquidity import RiskLiquidityResult  # noqa: F401 (import kept local, mirrors rest of file's style)
+
     yf = YFinanceFetcher()
     try:
         ohlcv = _get_ohlcv(yf, symbol)
@@ -332,8 +357,25 @@ def fetch_and_predict(symbol: str, is_fno: bool, series: Optional[str] = None) -
             return {"symbol": symbol, "error": f"insufficient OHLCV data ({len(ohlcv)} rows)"}
 
         fund = yf.fetch_fundamentals(symbol)
-        orch = ModelOrchestrator()
-        pred = orch.predict(symbol, ohlcv, fund, sentiment_score=0.0)
+
+        pred = None
+        from src.models.three_model_orchestrator import ThreeModelOrchestrator, artifacts_exist
+        if artifacts_exist():
+            try:
+                nifty_hist = _get_index_history_cached("^NSEI")
+                sensex_hist = _get_index_history_cached("^BSESN")
+                three_model_pred = ThreeModelOrchestrator().predict(
+                    symbol, ohlcv, nifty_df=nifty_hist, sensex_df=sensex_hist,
+                    market_regime=_current_market_regime,
+                )
+                three_model_pred["target_trading_date"] = _current_target_trading_date
+                pred = three_model_pred
+            except Exception as exc:
+                logger.debug("Three-model prediction failed for %s, falling back to legacy: %s", symbol, exc)
+
+        if pred is None:
+            orch = ModelOrchestrator()
+            pred = orch.predict(symbol, ohlcv, fund, sentiment_score=0.0)
 
         result = {"symbol": symbol, "fund": fund, "pred": pred, "is_fno": is_fno,
                   "series": series, "ohlcv": ohlcv}
@@ -359,28 +401,61 @@ def _categorize_error(err: str) -> str:
     return "other"
 
 
-async def _persist_price_history(db, stock_id: int, ohlcv) -> None:
+async def _persist_price_history(db, stock_id: int, symbol: str, ohlcv) -> None:
     """
     Bulk-upsert daily OHLCV bars so the prediction pipeline (and any future
     training run) can read history straight from Postgres instead of
     re-fetching it from Yahoo every time — nothing persisted it before this.
     ON CONFLICT DO UPDATE so a re-scan refreshes bars Yahoo later revises
     rather than silently skipping them.
+
+    Every bar is validated first (src/market/data_quality.py) — VALID/
+    SUSPECT bars land in price_history with their data_quality tagged;
+    INVALID bars go to price_history_quarantine instead (original values
+    preserved, never silently dropped) plus a DataQualityEvent row. An
+    unusual-but-arithmetically-consistent bar (a real split/circuit-limit
+    day) is SUSPECT, not INVALID — see validate_ohlc_bar's docstring for
+    exactly which rules reject a row outright.
     """
     if ohlcv is None or ohlcv.empty:
         return
-    rows = [
-        {
-            "stock_id": stock_id,
-            "date": idx.date(),
-            "open": float(row["Open"]),
-            "high": float(row["High"]),
-            "low": float(row["Low"]),
-            "close": float(row["Close"]),
-            "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
-        }
-        for idx, row in ohlcv.iterrows()
-    ]
+
+    from src.market.data_quality import validate_ohlc_bar
+    from src.database.models import DataQualityEvent, DataQualityStatus, PriceHistoryQuarantine
+
+    valid_rows, quarantine_rows, quality_events = [], [], []
+    for idx, row in ohlcv.iterrows():
+        result = validate_ohlc_bar(row.get("Open"), row.get("High"), row.get("Low"), row.get("Close"), row.get("Volume"))
+        bar_date = idx.date()
+        if result.is_usable:
+            valid_rows.append({
+                "stock_id": stock_id, "date": bar_date,
+                "open": float(row["Open"]), "high": float(row["High"]),
+                "low": float(row["Low"]), "close": float(row["Close"]),
+                "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+                "data_quality": result.status,
+            })
+            if result.status == DataQualityStatus.SUSPECT:
+                quality_events.append({"symbol": symbol, "date": bar_date, "status": result.status,
+                                        "issue_type": "; ".join(result.issues), "details": {"issues": result.issues}})
+        else:
+            quarantine_rows.append({
+                "symbol": symbol, "date": bar_date,
+                "open": row.get("Open"), "high": row.get("High"), "low": row.get("Low"),
+                "close": row.get("Close"), "volume": row.get("Volume"),
+                "quarantine_reason": "; ".join(result.issues),
+            })
+            quality_events.append({"symbol": symbol, "date": bar_date, "status": result.status,
+                                    "issue_type": "; ".join(result.issues), "details": {"issues": result.issues}})
+
+    if quarantine_rows:
+        logger.warning("%s: %d bar(s) failed OHLC validation, quarantined: %s",
+                        symbol, len(quarantine_rows), [r["quarantine_reason"] for r in quarantine_rows[:3]])
+        await db.execute(pg_insert(PriceHistoryQuarantine).values(quarantine_rows))
+    if quality_events:
+        await db.execute(pg_insert(DataQualityEvent).values(quality_events))
+
+    rows = valid_rows
     if not rows:
         return
     stmt = pg_insert(PriceHistory).values(rows)
@@ -389,7 +464,7 @@ async def _persist_price_history(db, stock_id: int, ohlcv) -> None:
         set_={
             "open": stmt.excluded.open, "high": stmt.excluded.high,
             "low": stmt.excluded.low, "close": stmt.excluded.close,
-            "volume": stmt.excluded.volume,
+            "volume": stmt.excluded.volume, "data_quality": stmt.excluded.data_quality,
         },
     )
     await db.execute(stmt)
@@ -407,7 +482,7 @@ async def persist_result(db, result: Dict) -> None:
         db.add(stock)
         await db.flush()
 
-    await _persist_price_history(db, stock.id, result.get("ohlcv"))
+    await _persist_price_history(db, stock.id, symbol, result.get("ohlcv"))
 
     stock.company_name = fund.get("company_name") or stock.company_name
     stock.sector = fund.get("sector")
@@ -428,24 +503,65 @@ async def persist_result(db, result: Dict) -> None:
     ):
         setattr(fundamental, field, fund.get(field))
 
-    db.add(Prediction(
-        stock_id=stock.id,
-        model_version="universe-scan-v1",
-        signal=SignalType(pred["signal"]),
-        confidence=pred["confidence"],
-        current_price=pred.get("current_price"),
-        predicted_return_1d=None,
-        predicted_return_5d=pred.get("predicted_return_5d"),
-        predicted_return_1m=None,
-        target_price=pred.get("target_price"),
-        stop_loss=pred.get("stop_loss"),
-        risk_reward_ratio=pred.get("risk_reward_ratio"),
-        sentiment_score=pred.get("sentiment_score"),
-        technical_score=pred.get("technical_score"),
-        fundamental_score=pred.get("fundamental_score"),
-        composite_score=pred.get("composite_score"),
-        feature_importance=pred.get("feature_importance") or None,
-    ))
+    if "decision" in pred:
+        # Three-model path (src/models/three_model_orchestrator.py) — a
+        # calibrated direction probability, a regression-based expected
+        # return, and a rule-based risk/liquidity read, combined by the
+        # transparent decision engine. `signal`/`confidence` are populated
+        # too, mapped from `decision`, purely so the existing UI (built
+        # against the legacy single-signal shape) keeps working without
+        # every page needing a rewrite in the same pass as the model change.
+        decision_to_signal = {
+            DecisionType.POSITIVE_SETUP: SignalType.BUY,
+            DecisionType.NEGATIVE_SETUP: SignalType.SELL,
+            DecisionType.NO_CLEAR_SIGNAL: SignalType.HOLD,
+        }
+        db.add(Prediction(
+            stock_id=stock.id,
+            model_version="three_model_v2",
+            feature_version=pred.get("feature_version"),
+            signal=decision_to_signal[pred["decision"]],
+            confidence=max(pred["probability_up"], pred["probability_down"]),
+            current_price=pred.get("current_price"),
+            predicted_return_1d=round(pred["expected_return"] * 100, 4) if pred.get("expected_return") is not None else None,
+            target_price=pred.get("target_price"),
+            stop_loss=pred.get("stop_loss"),
+            probability_up=pred.get("probability_up"),
+            probability_down=pred.get("probability_down"),
+            probability_flat=pred.get("probability_flat"),
+            expected_return=pred.get("expected_return"),
+            expected_return_lower=pred.get("expected_return_lower"),
+            expected_return_upper=pred.get("expected_return_upper"),
+            risk_level=pred.get("risk_level"),
+            liquidity_level=pred.get("liquidity_level"),
+            market_regime=pred.get("market_regime"),
+            decision=pred.get("decision"),
+            decision_factors=pred.get("decision_factors"),
+            target_trading_date=pred.get("target_trading_date"),
+        ))
+    else:
+        # Legacy single-composite path (src/models/ensemble/predictor.py) —
+        # kept as the fallback for symbols the three-model path can't yet
+        # handle (e.g. artifacts not trained, or insufficient rows for the
+        # newer feature set).
+        db.add(Prediction(
+            stock_id=stock.id,
+            model_version="universe-scan-v1",
+            signal=SignalType(pred["signal"]),
+            confidence=pred["confidence"],
+            current_price=pred.get("current_price"),
+            predicted_return_1d=None,
+            predicted_return_5d=pred.get("predicted_return_5d"),
+            predicted_return_1m=None,
+            target_price=pred.get("target_price"),
+            stop_loss=pred.get("stop_loss"),
+            risk_reward_ratio=pred.get("risk_reward_ratio"),
+            sentiment_score=pred.get("sentiment_score"),
+            technical_score=pred.get("technical_score"),
+            fundamental_score=pred.get("fundamental_score"),
+            composite_score=pred.get("composite_score"),
+            feature_importance=pred.get("feature_importance") or None,
+        ))
 
     if result.get("is_fno") and "fno_rec" in result:
         r = result["fno_rec"]
@@ -670,6 +786,26 @@ async def run_universe_scan(
                 "genuinely unreachable right now, not just rate-limited. Proceeding "
                 "anyway; AdaptiveThrottle's slow start still protects the real scan."
             )
+
+        # Computed ONCE for the whole run (not per symbol) — market regime
+        # and the actual next trading session (via the real NSE calendar,
+        # never a naive +1 calendar day). Read by fetch_and_predict's
+        # three-model path through the module-level globals set just below.
+        global _current_market_regime, _current_target_trading_date
+        try:
+            from src.market.regime import compute_and_store_regime
+            regime_snapshot = await compute_and_store_regime()
+            _current_market_regime = regime_snapshot["regime"] if regime_snapshot else None
+        except Exception as exc:
+            logger.warning("Market regime computation failed: %s — predictions this run won't have a regime label", exc)
+            _current_market_regime = None
+        try:
+            from src.market.trading_calendar import next_trading_day
+            _current_target_trading_date = await next_trading_day(datetime.utcnow().date())
+        except Exception as exc:
+            logger.warning("Trading calendar lookup failed: %s", exc)
+            _current_target_trading_date = None
+        _index_history_cache.clear()  # stale from a previous run otherwise
 
         last_failed = await _load_last_failed()
         pairs = _prioritize(

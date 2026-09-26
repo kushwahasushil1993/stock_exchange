@@ -61,7 +61,7 @@ def _fetch_symbol_features(symbol: str) -> Optional[Tuple[pd.DataFrame, pd.Serie
         fund = yf.fetch_fundamentals(symbol)
 
         enriched = TechnicalFeatures().compute(ohlcv)
-        X, y, _scaler, _features = FeaturePipeline().prepare_xgboost_input(
+        X, y, _scaler, _features, _fwd_return = FeaturePipeline().prepare_xgboost_input(
             enriched, fundamental=fund, sentiment=0.0, macro=None, horizon=5,
         )
         if X.empty:

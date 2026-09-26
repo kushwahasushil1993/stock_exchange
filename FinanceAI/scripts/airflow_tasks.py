@@ -62,6 +62,20 @@ def ingest_macro():
     print(f"✅ Ingested macro data for {len(data)} indicators")
 
 
+def track_outcomes():
+    """
+    Evaluates every prediction whose target trading session has already
+    happened against what actually occurred (src/pipelines/outcome_tracker.py)
+    — run BEFORE run_predictions in the daily DAG, since today's just-
+    refreshed price_history is exactly what's needed to score yesterday's
+    predictions (whose target_trading_date is today).
+    """
+    from src.pipelines.outcome_tracker import track_outcomes as _track
+
+    summary = asyncio.run(_track())
+    print(f"✅ Outcome tracking: {summary}")
+
+
 def run_predictions():
     """
     Full NSE universe (~2,300 equities + F&O + index F&O) — not just
@@ -127,13 +141,29 @@ def retrain_models():
     print(f"✅ Global model retrained: {summary}")
 
 
+def retrain_three_models():
+    """
+    Retrains the walk-forward-validated three-model split (Direction +
+    Expected Return; Risk/Liquidity is rule-based, not trained) — see
+    src/pipelines/train_three_models.py. Writes a new (inactive)
+    ModelRegistry row; promotion to production is a separate, explicit step
+    (champion/challenger, §70), never automatic on a training score alone.
+    """
+    from src.pipelines.train_three_models import train
+
+    summary = asyncio.run(train(sample_size=500, workers=8))
+    print(f"✅ Three-model retrain complete: {summary}")
+
+
 TASKS = {
     "ingest_ohlcv": ingest_ohlcv,
     "ingest_news": ingest_news,
     "ingest_macro": ingest_macro,
+    "track_outcomes": track_outcomes,
     "run_predictions": run_predictions,
     "notify_whatsapp": notify_whatsapp,
     "retrain_models": retrain_models,
+    "retrain_three_models": retrain_three_models,
 }
 
 if __name__ == "__main__":

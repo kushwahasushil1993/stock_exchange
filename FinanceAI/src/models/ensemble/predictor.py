@@ -152,7 +152,7 @@ class ModelOrchestrator:
         if not xgb_path.exists():
             xgb_path = self.model_base / "xgboost" / "_GLOBAL_xgb.pkl"
         if xgb_path.exists():
-            X_tab, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
+            X_tab, _, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
             if len(X_tab) > 0:
                 xgb = XGBoostModel()
                 xgb.load(str(xgb_path))
@@ -166,7 +166,7 @@ class ModelOrchestrator:
         if not lgbm_path.exists():
             lgbm_path = self.model_base / "lgbm" / "_GLOBAL_lgbm.pkl"
         if lgbm_path.exists():
-            X_tab2, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
+            X_tab2, _, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
             if len(X_tab2) > 0:
                 lgbm = LightGBMModel()
                 with open(lgbm_path, "rb") as fh:
@@ -227,7 +227,7 @@ class ModelOrchestrator:
         if xgb_path.exists():
             xgb2 = XGBoostModel()
             xgb2.load(str(xgb_path))
-            X_tab3, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
+            X_tab3, _, _, _, _ = fp.prepare_xgboost_input(enriched, fundamental, sentiment_score, macro)
             shap_imp = xgb2.get_shap_importance(X_tab3.iloc[-10:])
 
         return {

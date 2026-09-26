@@ -345,10 +345,29 @@ class FeaturePipeline:
         sentiment: Optional[float] = None,
         macro: Optional[Dict] = None,
         horizon: int = 5,
+        direction_classes: int = 2,
+        flat_threshold: float = 0.002,
+        return_threshold: float = 0.02,
     ) -> tuple:
         """
-        Prepare tabular features for XGBoost/LightGBM.
-        Target = 1 if 5-day forward return > 2%, 0 otherwise.
+        Prepare tabular features for XGBoost/LightGBM, plus BOTH a
+        classification target and the continuous forward return in one
+        pass (so a direction model and a return-regression model can be
+        trained from a single feature computation instead of duplicating
+        it) — see Model A/Model B in src/models/direction_model.py and
+        src/models/return_model.py.
+
+        direction_classes=2 (default, backward-compatible with existing
+        callers): target = 1 if forward return > return_threshold, else 0.
+        direction_classes=3: target = 2 (UP) if forward return >
+        flat_threshold, 0 (DOWN) if < -flat_threshold, else 1 (FLAT) — a
+        small dead-zone around zero so noise-level moves aren't forced into
+        a direction, matching "estimate probabilities... not force a
+        prediction."
+
+        Returns (X, y, scaler, features, fwd_return) — fwd_return is the
+        raw, unthresholded forward return for the SAME rows as X/y, for
+        regression training.
         """
         data = df.copy()
 
@@ -363,9 +382,16 @@ class FeaturePipeline:
         # through to the neutral 0.5 placeholder — for any symbol missing
         # even one fundamental field, not just ones truly short on history.
         data["fwd_return"] = data["Close"].pct_change(horizon).shift(-horizon)
-        data["target"] = (data["fwd_return"] > 0.02).astype(int)
+        if direction_classes == 3:
+            data["target"] = np.select(
+                [data["fwd_return"] > flat_threshold, data["fwd_return"] < -flat_threshold],
+                [2, 0],  # 2=UP, 0=DOWN
+                default=1,  # 1=FLAT
+            )
+        else:
+            data["target"] = (data["fwd_return"] > return_threshold).astype(int)
         tech_features = [f for f in self.XGBOOST_FEATURES if f in data.columns]
-        data = data[tech_features + ["target"]].dropna()
+        data = data[tech_features + ["target", "fwd_return"]].dropna()
 
         # Inject scalar features — always as a properly-typed float column,
         # for every field XGBOOST_FEATURES expects, even when this symbol
@@ -406,6 +432,7 @@ class FeaturePipeline:
         features = [f for f in self.XGBOOST_FEATURES if f in data.columns]
         X = data[features]
         y = data["target"]
+        fwd_return = data["fwd_return"]
 
         # Tree models don't need feature scaling (invariant to any monotonic
         # per-feature transform) — returning raw X keeps train and inference
@@ -416,4 +443,4 @@ class FeaturePipeline:
         scaler = None
         X_scaled = X
 
-        return X_scaled, y, scaler, features
+        return X_scaled, y, scaler, features, fwd_return

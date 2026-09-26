@@ -95,9 +95,15 @@ with DAG(
     tags            = ["predictions", "ml"],
 ) as dag2:
 
-    t_predict = PythonOperator(task_id="run_predictions", python_callable=lambda **ctx: _run_finai_task("run_predictions"))
-    t_notify  = PythonOperator(task_id="notify_whatsapp", python_callable=lambda **ctx: _run_finai_task("notify_whatsapp"))
-    t_predict >> t_notify
+    # track_outcomes runs FIRST: today's freshly-scanned price_history is
+    # exactly what's needed to score yesterday's predictions (whose
+    # target_trading_date is today) — evaluating before overwriting today's
+    # "latest prediction per stock" means nothing about scoring depends on
+    # ordering within the same run_predictions pass.
+    t_outcomes = PythonOperator(task_id="track_outcomes", python_callable=lambda **ctx: _run_finai_task("track_outcomes"))
+    t_predict  = PythonOperator(task_id="run_predictions", python_callable=lambda **ctx: _run_finai_task("run_predictions"))
+    t_notify   = PythonOperator(task_id="notify_whatsapp", python_callable=lambda **ctx: _run_finai_task("notify_whatsapp"))
+    t_outcomes >> t_predict >> t_notify
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -105,7 +111,7 @@ with DAG(
 # ════════════════════════════════════════════════════════════════════════════
 with DAG(
     dag_id       = "weekly_model_retraining",
-    description  = "Retrain the shared cross-sectional XGBoost + LightGBM model on fresh data",
+    description  = "Retrain the shared cross-sectional XGBoost + LightGBM model, and the walk-forward-validated three-model split, on fresh data",
     schedule     = "0 2 * * 0",   # Sunday 2 AM UTC
     start_date   = START_DATE,
     default_args = DEFAULT_ARGS,
@@ -114,3 +120,4 @@ with DAG(
 ) as dag3:
 
     PythonOperator(task_id="retrain_models", python_callable=lambda **ctx: _run_finai_task("retrain_models"))
+    PythonOperator(task_id="retrain_three_models", python_callable=lambda **ctx: _run_finai_task("retrain_three_models"))
