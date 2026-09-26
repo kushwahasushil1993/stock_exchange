@@ -61,6 +61,12 @@ class Stock(Base):
     sector: Mapped[Optional[str]] = mapped_column(String(100))
     industry: Mapped[Optional[str]] = mapped_column(String(100))
     market_cap: Mapped[Optional[float]] = mapped_column(Float)
+    # NSE listing series: "EQ" (normal main-board trading) vs "BE"/"BZ"
+    # (trade-to-trade — under surveillance for volatility/illiquidity/
+    # compliance; still real NSE equities, just thinner, more volatile
+    # trading worth flagging distinctly in the UI). Null for anything
+    # scanned before this column existed.
+    series: Mapped[Optional[str]] = mapped_column(String(4))
     is_fno_eligible: Mapped[bool] = mapped_column(Boolean, default=False)
     asset_type: Mapped[AssetType] = mapped_column(Enum(AssetType), default=AssetType.EQUITY)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

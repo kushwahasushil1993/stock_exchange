@@ -81,13 +81,18 @@ with DAG(
 # DAG 2: Daily Prediction Pipeline
 # ════════════════════════════════════════════════════════════════════════════
 with DAG(
-    dag_id       = "daily_prediction_pipeline",
-    description  = "Run ML ensemble predictions for the full NSE universe (equities + F&O + indices), then notify via WhatsApp",
-    schedule     = "0 10 * * 1-5",   # 10 AM IST weekdays
-    start_date   = START_DATE,
-    default_args = DEFAULT_ARGS,
-    catchup      = False,
-    tags         = ["predictions", "ml"],
+    dag_id          = "daily_prediction_pipeline",
+    description     = "Run ML ensemble predictions for the full NSE universe (equities + F&O + indices), then notify via WhatsApp",
+    schedule        = "0 10 * * 1-5",   # 10 AM IST weekdays
+    start_date      = START_DATE,
+    default_args    = DEFAULT_ARGS,
+    catchup         = False,
+    max_active_runs = 1,               # never let a slow run overlap with the next day's trigger —
+                                        # confirmed runs were piling up a full day behind schedule
+                                        # (universe_scan.py's own retry budget wasn't enforced
+                                        # mid-pass, so a single run could take 3-9+ hours; that's
+                                        # fixed now too, but this is a second, independent guard)
+    tags            = ["predictions", "ml"],
 ) as dag2:
 
     t_predict = PythonOperator(task_id="run_predictions", python_callable=lambda **ctx: _run_finai_task("run_predictions"))

@@ -152,12 +152,31 @@ async def _analyze_equity(query: str) -> Dict[str, Any]:
     # symbol-extraction sentiment pipeline, which only recognizes ~50
     # hardcoded large-cap symbols (src/sentiment/analyzer.py NSE_SYMBOLS) —
     # not useful for the other ~2,250 NSE-listed names.
+    #
+    # An unquoted "{company_name} share price" query (the old approach)
+    # confirmed pulling in completely unrelated articles for real
+    # symbols — a Baozun share-buyback story, a Rocket Lab acquisition —
+    # matched only because they contained the word "share". NewsAPI treats
+    # unquoted queries as a loose OR/relevance match across individual
+    # words, not "this article is actually about this company". Fixed two
+    # ways: an exact-phrase query (dropping the "Limited"/"Ltd" suffix,
+    # since headlines almost always drop it too — keeping it would make
+    # the phrase match too narrow) plus a hard post-filter requiring the
+    # company name to actually appear in the article text, independent of
+    # whatever NewsAPI itself decided was a match.
+    import re as _re
+    core_name = _re.sub(r"\s+(Limited|Ltd\.?|Pvt\.?|Private)\s*$", "", match["company_name"], flags=_re.IGNORECASE).strip()
     news = NewsFetcher()
-    articles = await news.fetch_newsapi(
-        query=f"{match['company_name']} share price",
+    raw_articles = await news.fetch_newsapi(
+        query=f'"{core_name}"',
         days_back=7,
         page_size=20,
     )
+    core_name_lower = core_name.lower()
+    articles = [
+        a for a in raw_articles
+        if core_name_lower in f"{a.get('title', '')} {a.get('description') or ''}".lower()
+    ]
     sentiment_score = 0.0
     headlines: List[str] = []
     if articles:

@@ -132,6 +132,11 @@ INDEX_FNO = {
     "FINNIFTY":   {"yf_symbol": "NIFTY_FIN_SERVICE.NS", "company_name": "Nifty Financial Services"},
     "MIDCPNIFTY": {"yf_symbol": "^NSEMDCP50",    "company_name": "Nifty Midcap 50"},
     "NIFTYNXT50": {"yf_symbol": "^NSMIDCP",      "company_name": "Nifty Next 50"},
+    # BSE's benchmark index (not NSE/F&O-traded like the rest of this
+    # registry, but tracked the same way for market-direction context —
+    # ticker verified directly against yfinance's own .info["longName"]
+    # ("S&P BSE SENSEX"), same rigor as every other entry here).
+    "SENSEX":     {"yf_symbol": "^BSESN",        "company_name": "S&P BSE Sensex"},
 }
 # FINNIFTY (NIFTY_FIN_SERVICE.NS) has a live price on Yahoo but only ~1 day
 # of historical OHLCV — genuinely insufficient for the technical-indicator
@@ -160,10 +165,20 @@ class NSEUniverseFetcher:
     # Index derivatives that appear in fo_mktlots.csv alongside single-stock ones
     INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "NIFTYFPI"}
 
+    # SERIES values worth scanning. EQ = normal main-board trading (the vast
+    # majority). BE/BZ = "trade-to-trade" — NSE settlement categories for
+    # stocks under surveillance for volatility/illiquidity/compliance flags;
+    # still real, live NSE-listed equities with their own price history, just
+    # thinner and more volatile trading. Every other series (debt
+    # instruments, rights entitlements, SDLs, etc.) is excluded — those
+    # aren't equities at all, not a coverage gap.
+    EQUITY_SERIES = {"EQ", "BE", "BZ"}
+
     async def fetch_equity_symbols(self) -> List[Dict[str, str]]:
         """
-        All NSE main-board (SERIES == EQ) listed equities.
-        Returns [{"symbol": "RELIANCE", "yf_symbol": "RELIANCE.NS", "company_name": "..."}]
+        All NSE-listed equities in EQUITY_SERIES (EQ + BE + BZ — see that
+        set's comment for what each means and why).
+        Returns [{"symbol": "RELIANCE", "yf_symbol": "RELIANCE.NS", "company_name": "...", "series": "EQ"}]
         """
         import csv
         import io
@@ -176,7 +191,8 @@ class NSEUniverseFetcher:
         result = []
         for row in reader:
             row = {k.strip(): (v.strip() if v else v) for k, v in row.items()}
-            if row.get("SERIES") != "EQ":
+            series = row.get("SERIES")
+            if series not in self.EQUITY_SERIES:
                 continue
             symbol = row.get("SYMBOL", "")
             if not symbol:
@@ -185,6 +201,7 @@ class NSEUniverseFetcher:
                 "symbol": symbol,
                 "yf_symbol": f"{symbol}.NS",
                 "company_name": row.get("NAME OF COMPANY", symbol),
+                "series": series,
             })
         return result
 
@@ -314,6 +331,7 @@ class NewsFetcher:
         query: str = "Indian stock market NSE BSE Nifty",
         days_back: int = 3,
         page_size: int = 100,
+        sort_by: str = "relevancy",
     ) -> List[Dict[str, Any]]:
         if not self.api_key:
             logger.warning("NewsAPI key not set, skipping NewsAPI fetch")
@@ -323,7 +341,16 @@ class NewsFetcher:
         params = {
             "q": query,
             "from": from_date,
-            "sortBy": "publishedAt",
+            # "publishedAt" (the old default) ranks purely by recency,
+            # regardless of how well an article actually matches `query` —
+            # confirmed pulling in completely unrelated articles (a Baozun
+            # share buyback, a Rocket Lab acquisition) for a Reliance
+            # Industries query, just because they were recent and loosely
+            # matched a generic word like "share". Relevancy sort plus the
+            # exact-phrase query callers now build (see analyze.py) fixes
+            # this at the source; _filter_relevant_articles below is a
+            # second, independent check on top.
+            "sortBy": sort_by,
             "language": "en",
             "pageSize": page_size,
             "apiKey": self.api_key,

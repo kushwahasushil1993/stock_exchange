@@ -1,7 +1,8 @@
 """
-Full-universe pipeline: fetch every NSE-listed equity (~2,300 symbols) and
-every F&O-eligible stock among them (~210), run the prediction engine on
-each, and persist buy/sell signals to Postgres.
+Full-universe pipeline: fetch every NSE-listed equity (~2,585 symbols —
+main-board "EQ" plus the "BE"/"BZ" trade-to-trade series) and every
+F&O-eligible stock among them (~210), run the prediction engine on each,
+and persist buy/sell signals to Postgres.
 
     python scripts/run_full_universe_pipeline.py                 # full run
     python scripts/run_full_universe_pipeline.py --limit 50       # smoke test
