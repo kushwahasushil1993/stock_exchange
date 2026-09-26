@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func, or_
 from sqlalchemy.orm import aliased
 
-from src.database.models import get_db, Prediction, SignalType, Stock
+from src.database.models import get_db, DecisionType, LiquidityLevel, MarketRegime, Prediction, RiskLevel, SignalType, Stock
 from src.database.models import redis_cache
 from src.api.routers.auth import get_current_user, User
 from config.settings import settings
@@ -23,6 +23,47 @@ router = APIRouter()
 
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
+class ThreeModelOut(BaseModel):
+    """
+    The three-model split's own fields (§20-21) — kept as a separate nested
+    object rather than flattened, so it's obvious at a glance which
+    predictions actually went through Model A/B/C + the decision engine
+    (model_type == "three_model_v2") vs the legacy single-composite path,
+    for which every field here is null rather than a fabricated 0.
+    """
+    decision:              Optional[str] = None
+    decision_factors:      Optional[dict] = None
+    probability_up:        Optional[float] = None
+    probability_down:      Optional[float] = None
+    probability_flat:      Optional[float] = None
+    expected_return:       Optional[float] = None
+    expected_return_lower: Optional[float] = None
+    expected_return_upper: Optional[float] = None
+    risk_level:            Optional[str] = None
+    liquidity_level:       Optional[str] = None
+    market_regime:         Optional[str] = None
+    target_trading_date:   Optional[str] = None
+    model_version:         Optional[str] = None
+    feature_version:       Optional[str] = None
+
+
+def _three_model_out(pred: Prediction) -> Optional[ThreeModelOut]:
+    """None for legacy predictions (decision is only ever set on the three-model path) — never fabricate these fields for a row the three-model system didn't actually produce."""
+    if pred.decision is None:
+        return None
+    return ThreeModelOut(
+        decision=pred.decision.value,
+        decision_factors=pred.decision_factors,
+        probability_up=pred.probability_up, probability_down=pred.probability_down, probability_flat=pred.probability_flat,
+        expected_return=pred.expected_return, expected_return_lower=pred.expected_return_lower, expected_return_upper=pred.expected_return_upper,
+        risk_level=pred.risk_level.value if pred.risk_level else None,
+        liquidity_level=pred.liquidity_level.value if pred.liquidity_level else None,
+        market_regime=pred.market_regime.value if pred.market_regime else None,
+        target_trading_date=pred.target_trading_date.isoformat() if pred.target_trading_date else None,
+        model_version=pred.model_version, feature_version=pred.feature_version,
+    )
+
+
 class PredictionOut(BaseModel):
     symbol:              str
     signal:              str
@@ -38,6 +79,7 @@ class PredictionOut(BaseModel):
     predicted_return_5d: float
     feature_importance:  dict
     predicted_at:        str
+    three_model:         Optional[ThreeModelOut] = None
 
     class Config:
         from_attributes = True
@@ -65,6 +107,7 @@ class StockRowOut(BaseModel):
     stop_loss:             Optional[float]
     predicted_return_5d:  Optional[float]
     predicted_at:          Optional[str]
+    three_model:           Optional[ThreeModelOut] = None
 
 
 class AllStocksResponse(BaseModel):
@@ -155,6 +198,7 @@ async def get_top_picks(
             predicted_return_5d = pred.predicted_return_5d or pred.predicted_return_1d or 0,
             feature_importance  = pred.feature_importance or {},
             predicted_at        = pred.predicted_at.isoformat(),
+            three_model         = _three_model_out(pred),
         )
         if pred.signal.value == "BUY":
             buy_picks.append(p)
@@ -234,11 +278,214 @@ async def list_all_stocks(
             stop_loss=pred.stop_loss if pred else None,
             predicted_return_5d=pred.predicted_return_5d if pred else None,
             predicted_at=pred.predicted_at.isoformat() if pred else None,
+            three_model=_three_model_out(pred) if pred else None,
         )
         for stock, pred in rows
     ]
 
     return AllStocksResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+# ─── Single-symbol detail (§45-51) ────────────────────────────────────────────
+class OutcomeOut(BaseModel):
+    actual_close:        Optional[float] = None
+    actual_return:       Optional[float] = None
+    actual_direction:    Optional[str] = None
+    prediction_correct:  Optional[bool] = None
+    prediction_error:    Optional[float] = None
+    evaluated_at:        Optional[str] = None
+
+
+class LatestPredictionResponse(BaseModel):
+    symbol:               str
+    company_name:         str
+    current_price:        Optional[float]
+    signal:               str
+    confidence:           float
+    target_price:         Optional[float]
+    stop_loss:            Optional[float]
+    predicted_at:         str
+    target_trading_date:  Optional[str]
+    three_model:          Optional[ThreeModelOut]
+    outcome:              Optional[OutcomeOut]
+
+
+@router.get("/{symbol}/latest", response_model=LatestPredictionResponse)
+async def get_latest_prediction_for_symbol(
+    symbol: str,
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """
+    The single latest STORED prediction for one symbol, with full
+    three-model detail (decision, calibrated probabilities, expected-return
+    interval, risk/liquidity, market regime, decision factors) when it was
+    produced by the three-model path — this is what backs StockDetails'
+    "what the model actually predicted" panel, as distinct from
+    /analyze/stock's live on-demand legacy analysis. Also includes the
+    actual outcome (src/pipelines/outcome_tracker.py) once the target
+    trading session has resolved, so a stale or wrong prediction is visible
+    on the page, not just the confident-looking parts.
+    """
+    res = await db.execute(select(Stock).where(Stock.symbol == symbol))
+    stock = res.scalar_one_or_none()
+    if not stock:
+        raise HTTPException(status_code=404, detail=f"{symbol} not found")
+
+    pred = (
+        await db.execute(
+            select(Prediction).where(Prediction.stock_id == stock.id)
+            .order_by(desc(Prediction.predicted_at)).limit(1)
+        )
+    ).scalar_one_or_none()
+    if not pred:
+        raise HTTPException(status_code=404, detail=f"No prediction stored yet for {symbol} — run a universe scan or trigger one for this symbol first.")
+
+    from src.database.models import PredictionOutcome
+    outcome_row = (
+        await db.execute(select(PredictionOutcome).where(PredictionOutcome.prediction_id == pred.id))
+    ).scalar_one_or_none()
+    outcome = None
+    if outcome_row:
+        outcome = OutcomeOut(
+            actual_close=outcome_row.actual_close, actual_return=outcome_row.actual_return,
+            actual_direction=outcome_row.actual_direction, prediction_correct=outcome_row.prediction_correct,
+            prediction_error=outcome_row.prediction_error,
+            evaluated_at=outcome_row.evaluated_at.isoformat() if outcome_row.evaluated_at else None,
+        )
+
+    return LatestPredictionResponse(
+        symbol=symbol, company_name=stock.company_name, current_price=pred.current_price,
+        signal=pred.signal.value, confidence=pred.confidence,
+        target_price=pred.target_price, stop_loss=pred.stop_loss,
+        predicted_at=pred.predicted_at.isoformat(),
+        target_trading_date=pred.target_trading_date.isoformat() if pred.target_trading_date else None,
+        three_model=_three_model_out(pred), outcome=outcome,
+    )
+
+
+# ─── Honest performance reporting (§69/§81) ───────────────────────────────────
+class FoldMetricOut(BaseModel):
+    fold_number:               int
+    validation_start:          str
+    validation_end:            str
+    validation_rows:           int
+    accuracy:                  Optional[float] = None
+    majority_class_accuracy:   Optional[float] = None
+    brier_score:                Optional[float] = None
+    log_loss:                   Optional[float] = None
+
+
+class ModelHonestyReport(BaseModel):
+    model_id:                    int
+    model_name:                  str
+    version:                     str
+    trained_at:                  str
+    is_active:                   bool
+    training_period_start:       Optional[str]
+    training_period_end:         Optional[str]
+    folds:                       List[FoldMetricOut]
+    calibration_metrics:         Optional[dict]
+    return_model_metrics:        Optional[dict]
+    # Computed here (not stored anywhere) by comparing the average fold
+    # accuracy to the average fold majority-class baseline across the SAME
+    # folds — the one honest headline number, rather than a bare accuracy
+    # that looks fine in isolation but doesn't beat "always guess the same
+    # class."
+    beats_baseline_on_average:  Optional[bool] = None
+
+
+class OutcomeSummaryOut(BaseModel):
+    resolved_predictions:      int
+    correct:                    int
+    accuracy:                   Optional[float] = None
+    mean_absolute_error:        Optional[float] = None
+    note:                        str
+
+
+class PerformanceResponse(BaseModel):
+    latest_model:      Optional[ModelHonestyReport]
+    outcome_summary:   OutcomeSummaryOut
+
+
+@router.get("/performance", response_model=PerformanceResponse)
+async def get_prediction_performance(
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """
+    The honest out-of-sample performance report (§69/§81): the latest
+    trained model's walk-forward fold-by-fold metrics compared against the
+    majority-class baseline computed on those SAME folds (never a bare
+    accuracy number — beating a naive "always guess the same class"
+    baseline is the actual bar, per §33), plus how live predictions have
+    actually resolved so far via PredictionOutcome. This is the platform's
+    single place required to "tell the truth when it performs poorly"
+    (§81) instead of only ever surfacing a confident-looking number — if
+    resolved_predictions is 0, that's reported as exactly that, not hidden
+    behind a fabricated accuracy.
+    """
+    from src.database.models import ModelRegistry, ModelTrainingRun, PredictionOutcome
+
+    model_row = (
+        await db.execute(select(ModelRegistry).order_by(desc(ModelRegistry.trained_at)).limit(1))
+    ).scalar_one_or_none()
+
+    latest_model = None
+    if model_row:
+        fold_rows = (
+            await db.execute(
+                select(ModelTrainingRun).where(ModelTrainingRun.model_id == model_row.id)
+                .order_by(ModelTrainingRun.fold_number)
+            )
+        ).scalars().all()
+        folds = []
+        accs, baselines = [], []
+        for fr in fold_rows:
+            m = fr.metrics or {}
+            if m.get("accuracy") is not None:
+                accs.append(m["accuracy"])
+            if m.get("majority_class_accuracy") is not None:
+                baselines.append(m["majority_class_accuracy"])
+            folds.append(FoldMetricOut(
+                fold_number=fr.fold_number,
+                validation_start=fr.validation_start.isoformat(), validation_end=fr.validation_end.isoformat(),
+                validation_rows=fr.validation_rows or 0,
+                accuracy=m.get("accuracy"), majority_class_accuracy=m.get("majority_class_accuracy"),
+                brier_score=m.get("brier_score"), log_loss=m.get("log_loss"),
+            ))
+        beats = None
+        if accs and baselines and len(accs) == len(baselines):
+            beats = (sum(accs) / len(accs)) > (sum(baselines) / len(baselines))
+
+        latest_model = ModelHonestyReport(
+            model_id=model_row.id, model_name=model_row.model_name, version=model_row.version,
+            trained_at=model_row.trained_at.isoformat(), is_active=model_row.is_active,
+            training_period_start=model_row.training_period_start.isoformat() if model_row.training_period_start else None,
+            training_period_end=model_row.training_period_end.isoformat() if model_row.training_period_end else None,
+            folds=folds, calibration_metrics=model_row.calibration_metrics,
+            return_model_metrics=(model_row.metrics or {}).get("return_model"),
+            beats_baseline_on_average=beats,
+        )
+
+    outcome_rows = (await db.execute(select(PredictionOutcome))).scalars().all()
+    resolved = len(outcome_rows)
+    correct = sum(1 for o in outcome_rows if o.prediction_correct)
+    errors = [o.prediction_error for o in outcome_rows if o.prediction_error is not None]
+    outcome_summary = OutcomeSummaryOut(
+        resolved_predictions=resolved,
+        correct=correct,
+        accuracy=round(correct / resolved, 4) if resolved else None,
+        mean_absolute_error=round(sum(errors) / len(errors), 5) if errors else None,
+        note=(
+            "No predictions have reached their target trading date yet — there is "
+            "nothing to evaluate. This is expected right after a fresh scan, not an error."
+            if resolved == 0 else
+            f"Based on {resolved} resolved prediction(s) so far."
+        ),
+    )
+
+    return PerformanceResponse(latest_model=latest_model, outcome_summary=outcome_summary)
 
 
 @router.post("/trade-agents/plan", response_model=TradeAgentPlanResponse)
