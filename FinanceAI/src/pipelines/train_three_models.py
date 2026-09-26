@@ -55,7 +55,7 @@ HORIZON_DAYS = 1  # next-session direction/return, per §22 — not the old 5-da
 FLAT_THRESHOLD = 0.002  # +/-0.2% dead zone around zero — see prepare_xgboost_input's direction_classes=3
 FOLD_MONTHS = 6  # expanding-window fold length
 
-FEATURE_VERSION = "v2_walkforward_no_fundamentals"
+FEATURE_VERSION = "v4_regularized_earlystop"
 
 # Excludes every fundamental field from XGBOOST_FEATURES — see this file's
 # module docstring for why. Everything else (technical + whatever market-
@@ -141,6 +141,55 @@ def _make_folds(min_date: pd.Timestamp, max_date: pd.Timestamp) -> List[Tuple[pd
     return folds
 
 
+INNER_EVAL_FRACTION = 0.15  # last 15% of each training window, by date, held out for early stopping — never the actual validation fold
+
+
+def _inner_split(train_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Carves the CHRONOLOGICALLY LAST slice of a training window into an
+    early-stopping eval set — still strictly before the real walk-forward
+    validation fold, so this never leaks the actual out-of-sample test.
+    Existing tree fits used a fixed n_estimators with no regularization
+    signal at all beyond hard-coded max_depth/subsample; this gives
+    XGBoost's early_stopping_rounds an honest, point-in-time-correct
+    target to stop against instead of always running the full budget
+    regardless of overfitting.
+    """
+    dates = np.sort(train_df["date"].unique())
+    if len(dates) < 40:  # too little history for a meaningful inner split — caller falls back to no early stopping
+        return train_df, train_df.iloc[0:0]
+    cutoff = dates[int(len(dates) * (1 - INNER_EVAL_FRACTION))]
+    return train_df[train_df["date"] < cutoff], train_df[train_df["date"] >= cutoff]
+
+
+def _fit_direction_classifier(X_tr: pd.DataFrame, y_tr: pd.Series, train_df: pd.DataFrame, feature_cols: List[str], n_estimators: int):
+    """
+    Regularized XGBoost direction classifier with early stopping against a
+    chronological inner holdout (see _inner_split) — replaces the previous
+    fixed-n_estimators, lightly-regularized fit for both the per-fold
+    walk-forward classifiers and the final production model, so both are
+    trained the same way.
+    """
+    import xgboost as xgb
+
+    inner_train, inner_eval = _inner_split(train_df)
+    common = dict(
+        max_depth=4, learning_rate=0.03, subsample=0.7, colsample_bytree=0.6,
+        min_child_weight=20, reg_alpha=0.5, reg_lambda=2.0,
+        objective="multi:softprob", num_class=3, tree_method="hist", random_state=42, n_jobs=-1,
+    )
+    if len(inner_eval) >= 500:
+        clf = xgb.XGBClassifier(n_estimators=n_estimators, eval_metric="mlogloss", early_stopping_rounds=30, **common)
+        clf.fit(
+            inner_train[feature_cols], inner_train["target"].astype(int),
+            eval_set=[(inner_eval[feature_cols], inner_eval["target"].astype(int))], verbose=False,
+        )
+    else:
+        clf = xgb.XGBClassifier(n_estimators=n_estimators, **common)
+        clf.fit(X_tr, y_tr)
+    return clf
+
+
 def _multiclass_brier(y_true: np.ndarray, proba: np.ndarray, n_classes: int = 3) -> float:
     """Standard multi-class generalization of the Brier score: mean squared distance between the predicted probability vector and the one-hot true label."""
     one_hot = np.eye(n_classes)[y_true]
@@ -222,11 +271,7 @@ async def train(sample_size: int = 500, workers: int = 8) -> dict:
         X_tr, y_tr = train_df[feature_cols], train_df["target"].astype(int)
         X_val, y_val = val_df[feature_cols], val_df["target"].astype(int)
 
-        clf = xgb.XGBClassifier(
-            n_estimators=200, max_depth=5, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
-            objective="multi:softprob", num_class=3, tree_method="hist", random_state=42, n_jobs=-1,
-        )
-        clf.fit(X_tr, y_tr)
+        clf = _fit_direction_classifier(X_tr, y_tr, train_df, feature_cols, n_estimators=500)
         proba = clf.predict_proba(X_val)
         preds = proba.argmax(axis=1)
 
@@ -258,11 +303,7 @@ async def train(sample_size: int = 500, workers: int = 8) -> dict:
     calib_slice = pool[pool["date"] >= final_train_end]
     X_final, y_final = final_train[feature_cols], final_train["target"].astype(int)
 
-    base_clf = xgb.XGBClassifier(
-        n_estimators=300, max_depth=5, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
-        objective="multi:softprob", num_class=3, tree_method="hist", random_state=42, n_jobs=-1,
-    )
-    base_clf.fit(X_final, y_final)
+    base_clf = _fit_direction_classifier(X_final, y_final, final_train, feature_cols, n_estimators=800)
 
     calibration_metrics = {}
     calibrated_clf = base_clf
@@ -313,7 +354,7 @@ async def train(sample_size: int = 500, workers: int = 8) -> dict:
     from src.database.models import AsyncSessionFactory, ModelRegistry, ModelTrainingRun
     async with AsyncSessionFactory() as db:
         model_row = ModelRegistry(
-            model_name="direction_return_v2", version=f"v2_{int(time.time())}", model_type="xgboost+lightgbm",
+            model_name="direction_return_v4", version=f"v4_{int(time.time())}", model_type="xgboost+lightgbm",
             symbol=None, artifact_path=str(model_dir), feature_version=FEATURE_VERSION,
             hyperparameters={"direction": "XGBClassifier multi:softprob", "return": "LGBMRegressor quantile"},
             training_period_start=min_date.date(), training_period_end=final_train_end.date(),
