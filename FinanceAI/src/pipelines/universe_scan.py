@@ -380,7 +380,24 @@ def fetch_and_predict(symbol: str, is_fno: bool, series: Optional[str] = None) -
         result = {"symbol": symbol, "fund": fund, "pred": pred, "is_fno": is_fno,
                   "series": series, "ohlcv": ohlcv}
         if is_fno:
-            fno_rec = FNOAnalyzer().analyze(symbol, pred, option_chain={}, oi_data={})
+            # Real option-chain data, not the {} placeholder this used to
+            # pass — that made FNOAnalyzer._compute_pcr/_get_atm_iv silently
+            # fall through to their empty-input defaults (PCR hardcoded to
+            # 1.0, IV/max_pain always None) for every single F&O
+            # recommendation ever persisted, dressed up as real analysis.
+            # yfinance's own option_chain() shape (calls/puts DataFrames
+            # with real strike/openInterest/impliedVolatility columns) is
+            # exactly what FNOAnalyzer expects — no adapter needed, just
+            # actually calling it. oi_data stays {} — a real day-over-day
+            # OI CHANGE needs yesterday's OI snapshot persisted somewhere,
+            # which doesn't exist yet; oi_change_pct honestly defaults to
+            # 0.0 rather than a fabricated value until that's built.
+            option_chain = {}
+            try:
+                option_chain = yf.fetch_options_chain(symbol)
+            except Exception as exc:
+                logger.debug("No option chain for %s, F&O rec will use neutral defaults: %s", symbol, exc)
+            fno_rec = FNOAnalyzer().analyze(symbol, pred, option_chain=option_chain, oi_data={})
             result["fno_rec"] = fno_rec
         return result
     except Exception as exc:
