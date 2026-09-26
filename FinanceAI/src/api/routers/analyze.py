@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from src.api.routers.auth import get_current_user, User
+from src.api.routers.predictions import ThreeModelOut
 from src.database.models import redis_cache
 
 logger = logging.getLogger(__name__)
@@ -116,10 +117,125 @@ async def _resolve_equity(query: str) -> Dict[str, str]:
     raise HTTPException(status_code=404, detail=f"No NSE-listed equity or index matching '{query}'")
 
 
+def _risk_reward_ratio(current_price: float, target_price: float, stop_loss: float) -> float:
+    upside = abs(target_price - current_price)
+    downside = abs(current_price - stop_loss)
+    return round(upside / downside, 2) if downside > 0 else 0.0
+
+
+async def _run_three_model(yf_symbol: str, ohlcv, fund: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The properly walk-forward-validated three-model system (calibrated
+    direction probabilities, expected-return regression, rule-based risk/
+    liquidity, transparent decision engine) — the SAME system
+    src/pipelines/universe_scan.py uses for the daily scan, now also
+    backing on-demand analysis. Raises on any failure (insufficient data,
+    stale/mismatched artifacts) — the caller (_run_prediction) is expected
+    to catch this and fall back to the legacy model, same convention as
+    universe_scan.py's fetch_and_predict.
+    """
+    from src.database.models import MarketRegime
+    from src.market.regime import get_latest_regime
+    from src.market.sector_index import get_sector_index_symbol
+    from src.models.three_model_orchestrator import ThreeModelOrchestrator
+    from src.pipelines.universe_scan import _load_existing_ohlcv, _tz_naive
+
+    # ohlcv here is a fresh, tz-AWARE live yfinance fetch (unlike
+    # universe_scan.py's own OHLCV, already tz-stripped by the time it
+    # reaches this point) — nifty/sensex/sector history loaded from
+    # Postgres below is tz-naive (the column has no timezone concept at
+    # all), and joining tz-aware with tz-naive raises outright. Confirmed
+    # directly, not assumed — same class of bug this codebase already hit
+    # and fixed once for universe_scan.py's own merge logic.
+    ohlcv = _tz_naive(ohlcv)
+
+    loop = asyncio.get_event_loop()
+    sector_symbol = get_sector_index_symbol(fund.get("sector"))
+    nifty_df, sensex_df, sector_df = await asyncio.gather(
+        loop.run_in_executor(None, _load_existing_ohlcv, "^NSEI"),
+        loop.run_in_executor(None, _load_existing_ohlcv, "^BSESN"),
+        loop.run_in_executor(None, _load_existing_ohlcv, sector_symbol) if sector_symbol else asyncio.sleep(0, result=None),
+    )
+
+    regime_snapshot = await get_latest_regime()
+    market_regime = MarketRegime(regime_snapshot["regime"]) if regime_snapshot and regime_snapshot.get("regime") else None
+
+    pred = await loop.run_in_executor(
+        None,
+        lambda: ThreeModelOrchestrator().predict(
+            yf_symbol, ohlcv, nifty_df=nifty_df, sensex_df=sensex_df, sector_df=sector_df, market_regime=market_regime,
+        ),
+    )
+
+    from src.database.models import DecisionType
+    decision_to_signal = {DecisionType.POSITIVE_SETUP: "BUY", DecisionType.NEGATIVE_SETUP: "SELL", DecisionType.NO_CLEAR_SIGNAL: "HOLD"}
+
+    return {
+        "current_price": pred["current_price"], "target_price": pred["target_price"], "stop_loss": pred["stop_loss"],
+        "signal": decision_to_signal[pred["decision"]],
+        "confidence": round(max(pred["probability_up"], pred["probability_down"]), 4),
+        "expected_return_pct": round(pred["expected_return"] * 100, 4),
+        "return_horizon_days": 1,
+        "technical_score": None,  # the three-model system doesn't compute a single composite technical score — never fabricate one
+        "fundamental_score": None,
+        "predicted_at": pred["predicted_at"],
+        "three_model": {
+            "decision": pred["decision"].value,
+            "decision_factors": pred["decision_factors"],
+            "probability_up": pred["probability_up"], "probability_down": pred["probability_down"], "probability_flat": pred["probability_flat"],
+            "expected_return": pred["expected_return"], "expected_return_lower": pred["expected_return_lower"], "expected_return_upper": pred["expected_return_upper"],
+            "risk_level": pred["risk_level"].value if pred["risk_level"] else None,
+            "liquidity_level": pred["liquidity_level"].value if pred["liquidity_level"] else None,
+            "market_regime": pred["market_regime"].value if pred["market_regime"] else None,
+            "target_trading_date": None,
+            "model_version": pred.get("model_type"),
+            "feature_version": pred.get("feature_version"),
+        },
+    }
+
+
+async def _run_prediction(yf_symbol: str, ohlcv, fund: Dict[str, Any], sentiment_score: float) -> Dict[str, Any]:
+    """
+    Tries the three-model system first, falling back to the legacy
+    single-composite ModelOrchestrator only if the three-model artifacts
+    aren't trained yet or fail for this symbol. This endpoint used to call
+    ONLY the legacy model unconditionally — which is also what made it
+    break outright the moment the legacy model's separately-trained
+    artifact fell out of sync with the shared feature pipeline (a real
+    incident: swing-structure/sector features were added to the shared
+    XGBOOST_FEATURES list, the three-model artifacts were retrained to
+    match, but this endpoint's legacy model was not, and every call here
+    started raising "Feature shape mismatch"). Trying the properly-
+    retrained three-model system first removes that maintenance trap
+    rather than just papering over its latest occurrence.
+
+    Returns a dict with a STABLE shape regardless of which path ran:
+    current_price/target_price/stop_loss/signal/confidence/
+    expected_return_pct/return_horizon_days/technical_score(nullable)/
+    fundamental_score(nullable)/predicted_at/three_model(nullable dict).
+    """
+    from src.models.three_model_orchestrator import artifacts_exist
+
+    if artifacts_exist():
+        try:
+            return await _run_three_model(yf_symbol, ohlcv, fund)
+        except Exception as exc:
+            logger.debug("Three-model prediction failed for %s, falling back to legacy: %s", yf_symbol, exc)
+
+    from src.models.ensemble.predictor import ModelOrchestrator
+    pred = ModelOrchestrator().predict(yf_symbol, ohlcv, fund, sentiment_score)
+    return {
+        "current_price": pred["current_price"], "target_price": pred["target_price"], "stop_loss": pred["stop_loss"],
+        "signal": pred["signal"], "confidence": pred["confidence"],
+        "expected_return_pct": pred["predicted_return_5d"], "return_horizon_days": 5,
+        "technical_score": pred["technical_score"], "fundamental_score": pred["fundamental_score"],
+        "predicted_at": pred["predicted_at"], "three_model": None,
+    }
+
+
 # ─── Shared stock analysis ───────────────────────────────────────────────────
 async def _analyze_equity(query: str) -> Dict[str, Any]:
     from src.ingestion.data_fetcher import YFinanceFetcher, NewsFetcher
-    from src.models.ensemble.predictor import ModelOrchestrator
     from src.sentiment.analyzer import SentimentAnalyzer
 
     match = await _resolve_equity(query)
@@ -188,7 +304,7 @@ async def _analyze_equity(query: str) -> Dict[str, Any]:
         sentiment_score = round(sum(scores) / len(scores), 4) if scores else 0.0
         headlines = [a.get("title", "") for a in articles[:5]]
 
-    pred = ModelOrchestrator().predict(yf_symbol, ohlcv, fund, sentiment_score)
+    pred = await _run_prediction(yf_symbol, ohlcv, fund, sentiment_score)
 
     return {
         "symbol": yf_symbol,
@@ -196,14 +312,12 @@ async def _analyze_equity(query: str) -> Dict[str, Any]:
         "current_price": pred["current_price"],
         "target_price": pred["target_price"],
         "stop_loss": pred["stop_loss"],
-        # The ensemble is a short-term (5-trading-day) model — 5 years of
-        # history feeds its features/context, but it doesn't forecast a
-        # 5-year return. Labeled explicitly so this isn't overstated.
-        "expected_return_5d_pct": pred["predicted_return_5d"],
+        "expected_return_pct": pred["expected_return_pct"],
+        "return_horizon_days": pred["return_horizon_days"],
         "signal": pred["signal"],
         "recommendation": {"BUY": "Buy", "SELL": "Don't buy — sell/avoid", "HOLD": "Hold — no strong edge either way"}[pred["signal"]],
         "confidence": pred["confidence"],
-        "risk_reward_ratio": pred["risk_reward_ratio"],
+        "risk_reward_ratio": _risk_reward_ratio(pred["current_price"], pred["target_price"], pred["stop_loss"]),
         "technical_score": pred["technical_score"],
         "fundamental_score": pred["fundamental_score"],
         "sentiment_score": sentiment_score,
@@ -211,9 +325,13 @@ async def _analyze_equity(query: str) -> Dict[str, Any]:
             "articles_analyzed": len(articles),
             "headlines": headlines,
         },
-        "prediction_horizon_note": "expected_return_5d_pct is a 5-trading-day forecast, computed from 5 years of price history — not a 5-year return forecast.",
+        "prediction_horizon_note": (
+            f"expected_return_pct is a {pred['return_horizon_days']}-trading-day forecast, computed from 5 years "
+            "of price history — not a multi-year return forecast."
+        ),
         "predicted_at": pred["predicted_at"],
-        "_pred": pred,  # internal, stripped before response
+        "three_model": pred["three_model"],
+        "_pred": pred,  # internal, stripped before response — used by analyze_fno's FNOAnalyzer call
     }
 
 
@@ -229,17 +347,24 @@ class StockAnalysisOut(BaseModel):
     current_price: float
     target_price: float
     stop_loss: float
-    expected_return_5d_pct: float
+    expected_return_pct: float
+    return_horizon_days: int
     signal: str
     recommendation: str
     confidence: float
     risk_reward_ratio: float
-    technical_score: float
-    fundamental_score: float
+    # Only populated on the legacy fallback path — the three-model system
+    # doesn't compute a single composite technical/fundamental score, and
+    # this never fabricates one just to fill the field.
+    technical_score: Optional[float] = None
+    fundamental_score: Optional[float] = None
     sentiment_score: float
     news: NewsOut
     prediction_horizon_note: str
     predicted_at: str
+    # Populated only when the three-model system actually produced this
+    # prediction (None on the legacy fallback path) — see _run_prediction.
+    three_model: Optional[ThreeModelOut] = None
 
 
 def _nse_chain_to_analyzer_shape(nse_json: Dict[str, Any]) -> Dict[str, Any]:
