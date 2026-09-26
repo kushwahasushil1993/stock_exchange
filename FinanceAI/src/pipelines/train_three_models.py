@@ -55,7 +55,7 @@ HORIZON_DAYS = 1  # next-session direction/return, per §22 — not the old 5-da
 FLAT_THRESHOLD = 0.002  # +/-0.2% dead zone around zero — see prepare_xgboost_input's direction_classes=3
 FOLD_MONTHS = 6  # expanding-window fold length
 
-FEATURE_VERSION = "v4_regularized_earlystop"
+FEATURE_VERSION = "v5_swing_structure_features"
 
 # Excludes every fundamental field from XGBOOST_FEATURES — see this file's
 # module docstring for why. Everything else (technical + whatever market-
@@ -354,7 +354,7 @@ async def train(sample_size: int = 500, workers: int = 8) -> dict:
     from src.database.models import AsyncSessionFactory, ModelRegistry, ModelTrainingRun
     async with AsyncSessionFactory() as db:
         model_row = ModelRegistry(
-            model_name="direction_return_v4", version=f"v4_{int(time.time())}", model_type="xgboost+lightgbm",
+            model_name="direction_return_v5", version=f"v5_{int(time.time())}", model_type="xgboost+lightgbm",
             symbol=None, artifact_path=str(model_dir), feature_version=FEATURE_VERSION,
             hyperparameters={"direction": "XGBClassifier multi:softprob", "return": "LGBMRegressor quantile"},
             training_period_start=min_date.date(), training_period_end=final_train_end.date(),

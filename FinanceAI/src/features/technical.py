@@ -41,8 +41,17 @@ class TechnicalFeatures:
             df[f"ema_{w}"] = close.ewm(span=w, adjust=False).mean()
 
         df["sma_20_slope"]  = df["sma_20"].diff(5) / 5
+        df["sma_50_slope"]  = df["sma_50"].diff(5) / 5
+        df["sma_200_slope"] = df["sma_200"].diff(5) / 5
         df["price_vs_sma50"]= (close - df["sma_50"]) / df["sma_50"]
+        df["price_vs_ema20"]= (close - df["ema_20"]) / df["ema_20"]
+        df["price_vs_sma200"]=(close - df["sma_200"]) / df["sma_200"]
         df["golden_cross"]  = (df["sma_50"] > df["sma_200"]).astype(int)
+
+        # ── Swing structure (backward-looking only — see _swing_structure) ──
+        swing = self._swing_structure(high, low, close)
+        for col in swing.columns:
+            df[col] = swing[col]
 
         # MACD
         ema12 = close.ewm(span=12, adjust=False).mean()
@@ -54,6 +63,7 @@ class TechnicalFeatures:
             (df["macd"] > df["macd_signal"]) &
             (df["macd"].shift(1) <= df["macd_signal"].shift(1))
         ).astype(int)
+        df["macd_histogram_slope"] = df["macd_hist"].diff(5) / 5
 
         # Parabolic SAR (simplified)
         df["psar"] = self._parabolic_sar(high, low, close)
@@ -62,6 +72,8 @@ class TechnicalFeatures:
         # RSI
         for period in [9, 14, 21]:
             df[f"rsi_{period}"] = self._rsi(close, period)
+        df["rsi_slope"] = df["rsi_14"].diff(5) / 5
+        df["rsi_divergence"] = self._rsi_divergence(close, df["rsi_14"])
 
         # Stochastic %K %D
         df["stoch_k"], df["stoch_d"] = self._stochastic(high, low, close)
@@ -127,6 +139,19 @@ class TechnicalFeatures:
 
         # Trend strength
         df["adx"] = self._adx(high, low, close, 14)
+
+        # ── Support / resistance distance ───────────────────────────────────
+        # Rolling 20-bar high/low as a support/resistance proxy — both are
+        # backward-looking only (pandas .rolling(20) at row i uses rows
+        # [i-19, i], never i+1 onward), so this is safe to use as a
+        # same-day feature for a next-session target.
+        resistance = high.rolling(20).max()
+        support = low.rolling(20).min()
+        df["resistance_distance"] = (resistance - close) / close
+        df["support_distance"] = (close - support) / close
+
+        # ── Volume trend ─────────────────────────────────────────────────────
+        df["volume_trend"] = df["vol_sma_20"].pct_change(10)
 
         return df.replace([np.inf, -np.inf], np.nan)
 
@@ -209,6 +234,49 @@ class TechnicalFeatures:
     ) -> pd.Series:
         mfv = ((close - low) - (high - close)) / (high - low).replace(0, np.nan) * vol
         return mfv.rolling(period).sum() / vol.rolling(period).sum()
+
+    @staticmethod
+    def _swing_structure(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 10) -> pd.DataFrame:
+        """
+        higher_highs / higher_lows / lower_highs / lower_lows — whether this
+        window's price extreme exceeds the PRIOR (non-overlapping) window's
+        extreme. This is a backward-looking proxy for swing structure, not a
+        literal fractal/pivot detector: a real pivot-point detector needs N
+        bars AFTER a candidate point to confirm it's a local extreme, which
+        would only be knowable in hindsight — using it as a same-day feature
+        for a next-session target would be look-ahead leakage. Comparing two
+        adjacent backward-only rolling windows avoids that at the cost of
+        being a cruder signal.
+        """
+        roll_high = high.rolling(window).max()
+        roll_low = low.rolling(window).min()
+        prev_high = roll_high.shift(window)
+        prev_low = roll_low.shift(window)
+        return pd.DataFrame({
+            "higher_highs": (roll_high > prev_high).astype(int),
+            "lower_highs": (roll_high < prev_high).astype(int),
+            "higher_lows": (roll_low > prev_low).astype(int),
+            "lower_lows": (roll_low < prev_low).astype(int),
+        }, index=high.index)
+
+    @staticmethod
+    def _rsi_divergence(close: pd.Series, rsi: pd.Series, window: int = 10) -> pd.Series:
+        """
+        +1 = bullish divergence proxy (price making a lower low over this
+        window than the prior window, while RSI is making a higher low —
+        weakening downward momentum), -1 = bearish divergence proxy (price
+        higher high, RSI lower high), 0 = neither. Same backward-only,
+        adjacent-rolling-window comparison as _swing_structure, for the same
+        leakage-safety reason — not a strict pivot-to-pivot divergence
+        detector.
+        """
+        price_hh = close.rolling(window).max() > close.rolling(window).max().shift(window)
+        price_ll = close.rolling(window).min() < close.rolling(window).min().shift(window)
+        rsi_lh = rsi.rolling(window).max() < rsi.rolling(window).max().shift(window)
+        rsi_hl = rsi.rolling(window).min() > rsi.rolling(window).min().shift(window)
+        bearish = price_hh & rsi_lh
+        bullish = price_ll & rsi_hl
+        return bullish.astype(int) - bearish.astype(int)
 
     @staticmethod
     def _adx(
@@ -301,6 +369,14 @@ class FeaturePipeline:
         "gap_up", "gap_down",
         "candle_body", "upper_shadow", "lower_shadow",
         "golden_cross", "macd_crossover",
+        # New technical features — swing structure, S/R distance, MA slopes,
+        # RSI slope/divergence, MACD histogram slope, volume trend (all
+        # backward-looking only — see TechnicalFeatures._swing_structure /
+        # _rsi_divergence docstrings for the leakage-safety reasoning).
+        "sma_50_slope", "sma_200_slope", "price_vs_ema20", "price_vs_sma200",
+        "higher_highs", "lower_highs", "higher_lows", "lower_lows",
+        "resistance_distance", "support_distance",
+        "rsi_slope", "rsi_divergence", "macd_histogram_slope", "volume_trend",
         # Fundamental features added later
         "pe_ratio", "pb_ratio", "roe", "debt_to_equity",
         "revenue_growth_yoy", "profit_margin", "beta",
