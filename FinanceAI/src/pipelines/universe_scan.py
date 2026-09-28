@@ -457,7 +457,7 @@ async def _persist_price_history(db, stock_id: int, symbol: str, ohlcv) -> None:
             })
             if result.status == DataQualityStatus.SUSPECT:
                 quality_events.append({"symbol": symbol, "date": bar_date, "status": result.status,
-                                        "issue_type": "; ".join(result.issues), "details": {"issues": result.issues}})
+                                        "issue_type": "; ".join(result.issues)[:255], "details": {"issues": result.issues}})
         else:
             quarantine_rows.append({
                 "symbol": symbol, "date": bar_date,

@@ -209,7 +209,15 @@ class DataQualityEvent(Base):
     symbol: Mapped[str] = mapped_column(String(30), index=True)
     date: Mapped[Optional[datetime]] = mapped_column(Date)
     status: Mapped[DataQualityStatus] = mapped_column(Enum(DataQualityStatus))
-    issue_type: Mapped[Optional[str]] = mapped_column(String(100))
+    # Widened from 100 — a bar can fail multiple rules at once (e.g. "high <
+    # low; high < close; low > open"), and the joined string legitimately
+    # exceeds 100 chars for some real symbols (confirmed live:
+    # StringDataRightTruncationError crashed a full-universe scan on
+    # BROOKS.NS). The full, un-truncated list is always in `details` (JSON,
+    # unbounded) regardless — this column is a short label, not the source
+    # of truth, but insert-time truncation (universe_scan.py) is still
+    # applied defensively so no future case can crash the same way again.
+    issue_type: Mapped[Optional[str]] = mapped_column(String(255))
     details: Mapped[Optional[dict]] = mapped_column(JSON)
     detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
@@ -340,7 +348,19 @@ class Prediction(Base):
     # auditable after the fact rather than only reconstructable from
     # separately-timestamped tables.
     market_regime: Mapped[Optional[MarketRegime]] = mapped_column(Enum(MarketRegime))
-    decision: Mapped[Optional[DecisionType]] = mapped_column(Enum(DecisionType))
+    # values_callable is required here: DecisionType is the only enum in
+    # this file where a member's NAME differs from its VALUE
+    # (POSITIVE_SETUP -> "POSITIVE_DIRECTIONAL_SETUP") — SQLAlchemy's Enum
+    # type sends the member NAME to Postgres by default, but the actual
+    # decisiontype enum column was created with the VALUE strings. Every
+    # other enum in this file has name == value, so this exact bug is
+    # specific to this one column. It went undetected all session because
+    # every test scan happened to only ever produce NO_CLEAR_SIGNAL (name
+    # == value there too) — the first time a real POSITIVE_SETUP fired
+    # during a full scan, it crashed the INSERT outright ("invalid input
+    # value for enum decisiontype: 'POSITIVE_SETUP'"), aborting that
+    # scan run entirely.
+    decision: Mapped[Optional[DecisionType]] = mapped_column(Enum(DecisionType, values_callable=lambda obj: [e.value for e in obj]))
     decision_factors: Mapped[Optional[dict]] = mapped_column(JSON)  # {"positive": [...], "negative": [...]}
     news_snapshot: Mapped[Optional[dict]] = mapped_column(JSON)  # article ids/headlines actually used, for leakage audit
     # The actual next trading session (via TradingCalendar), not naive
