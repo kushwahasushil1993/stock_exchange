@@ -488,6 +488,164 @@ async def get_prediction_performance(
     return PerformanceResponse(latest_model=latest_model, outcome_summary=outcome_summary)
 
 
+# ─── "What should I buy today" (§ explicit product ask) ───────────────────────
+DISCLAIMER = (
+    "This is a probabilistic model output, not financial advice and not a "
+    "guarantee of profit. Backtested on real 2023-2026 data, this system's "
+    "trading strategy UNDERPERFORMED simply buying and holding NIFTY over "
+    "the same period (+2.4% vs +16.2%, Sharpe 0.12 vs 0.53) — see "
+    "/predictions/performance and the Model Performance page. Consult a "
+    "licensed financial advisor before making any investment decision."
+)
+
+LONG_TERM_FORECAST_NOTE = (
+    "A 1-year individual-stock price forecast is not something this system "
+    "produces, and it is not something any system trained on historical "
+    "price/technical data honestly can: over a year, a stock's return is "
+    "dominated by information that does not exist yet today — quarterly "
+    "results, management decisions, competitive moves, regulatory changes, "
+    "macro shocks. No amount of historical-pattern analysis reveals those "
+    "in advance. This platform's own models target the NEXT trading "
+    "session (1 day) specifically because that is the only horizon where "
+    "the input features (price/volume history) are still plausibly "
+    "informative — and even at that short horizon, walk-forward validation "
+    "found no reliable edge over a naive baseline (see /predictions/performance). "
+    "Professional equity research 1-year price targets carry wide error "
+    "bars and are frequently wrong for the same fundamental reason; treat "
+    "any 1-year stock prediction — from this system or elsewhere — with "
+    "that in mind."
+)
+
+
+class BestSignalOut(BaseModel):
+    symbol:                     str
+    company_name:               str
+    direction:                  str  # "UP" or "DOWN" — only POSITIVE_SETUP (UP) is surfaced by the default endpoint today
+    current_price:              float
+    target_price:               float
+    stop_loss:                  float
+    expected_return_pct:        float
+    expected_return_lower_pct:  float
+    expected_return_upper_pct:  float
+    probability_up:             float
+    probability_down:           float
+    risk_level:                 str
+    liquidity_level:            str
+    market_regime:              Optional[str]
+    decision_factors:           dict
+    target_trading_date:        Optional[str]
+    predicted_at:                str
+    fno_rationale:                Optional[str] = None  # e.g. "[BUY FUTURE] ..." — strategy name is embedded in this string as persisted by universe_scan.py
+
+
+class BestSignalResponse(BaseModel):
+    generated_at:              str
+    horizon_days:              int
+    asset_type:                str
+    signals:                   List[BestSignalOut]
+    count:                     int
+    note:                      str
+    long_term_forecast_note:   str
+    disclaimer:                str
+
+
+@router.get("/best-signal", response_model=BestSignalResponse)
+async def get_best_signal(
+    asset_type: str = Query(default="equity", pattern="^(equity|fno)$"),
+    limit: int = Query(default=10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """
+    "Which stock should I buy today" — the platform's own decision engine's
+    current POSITIVE_DIRECTIONAL_SETUP calls (Model A+B+C combined,
+    calibrated probabilities, real expected-return interval), ranked by
+    expected return. NOT a guaranteed pick: an EMPTY list is the common,
+    correct answer on most days (§44/§72 — NO_CLEAR_SIGNAL is normal), and
+    every response carries the same honesty disclaimer the rest of this
+    platform does. asset_type=fno additionally requires F&O eligibility and
+    attaches the derived futures/options strategy where one exists.
+
+    Only predictions whose target_trading_date hasn't already passed are
+    considered — a POSITIVE_SETUP call for a session that's already over
+    isn't "today's" signal, it's stale.
+    """
+    from datetime import date as date_cls, datetime
+    from src.database.models import FNORecommendation
+    from src.market.trading_calendar import is_trading_day
+
+    today = date_cls.today()
+
+    latest_sub = (
+        select(Prediction.stock_id, func.max(Prediction.predicted_at).label("latest"))
+        .group_by(Prediction.stock_id)
+        .subquery()
+    )
+    query = (
+        select(Prediction, Stock)
+        .join(Stock, Prediction.stock_id == Stock.id)
+        .join(latest_sub, (Prediction.stock_id == latest_sub.c.stock_id) & (Prediction.predicted_at == latest_sub.c.latest))
+        .where(Prediction.decision == DecisionType.POSITIVE_SETUP)
+        .where(Prediction.target_trading_date >= today)
+    )
+    if asset_type == "fno":
+        query = query.where(Stock.is_fno_eligible.is_(True))
+    query = query.order_by(desc(Prediction.expected_return)).limit(limit)
+
+    rows = (await db.execute(query)).all()
+
+    fno_by_symbol = {}
+    if asset_type == "fno" and rows:
+        symbols = [stock.symbol for _pred, stock in rows]
+        fno_rows = (
+            await db.execute(
+                select(FNORecommendation)
+                .where(FNORecommendation.symbol.in_(symbols))
+                .order_by(desc(FNORecommendation.created_at))
+            )
+        ).scalars().all()
+        for r in fno_rows:
+            fno_by_symbol.setdefault(r.symbol, r)  # first (most recent) wins
+
+    signals = []
+    for pred, stock in rows:
+        fno_rec = fno_by_symbol.get(stock.symbol)
+        signals.append(BestSignalOut(
+            symbol=stock.symbol, company_name=stock.company_name,
+            direction="UP", current_price=pred.current_price,
+            target_price=pred.target_price, stop_loss=pred.stop_loss,
+            expected_return_pct=round(pred.expected_return * 100, 4),
+            expected_return_lower_pct=round(pred.expected_return_lower * 100, 4),
+            expected_return_upper_pct=round(pred.expected_return_upper * 100, 4),
+            probability_up=pred.probability_up, probability_down=pred.probability_down,
+            risk_level=pred.risk_level.value if pred.risk_level else "UNKNOWN",
+            liquidity_level=pred.liquidity_level.value if pred.liquidity_level else "UNKNOWN",
+            market_regime=pred.market_regime.value if pred.market_regime else None,
+            decision_factors=pred.decision_factors or {},
+            target_trading_date=pred.target_trading_date.isoformat() if pred.target_trading_date else None,
+            predicted_at=pred.predicted_at.isoformat(),
+            fno_rationale=fno_rec.rationale if fno_rec else None,
+        ))
+
+    trading_today = await is_trading_day(today)
+    note = (
+        f"Found {len(signals)} stock(s) the decision engine currently rates a positive setup."
+        if signals else
+        "No stock currently clears the decision engine's bar for a positive setup — this is "
+        "the common, expected result (see disclaimer), not a system failure. Check back after "
+        "the next scan, or see /predictions/all for every stock's current read, including "
+        "the (usually large) NO_CLEAR_SIGNAL majority."
+    )
+    if not trading_today:
+        note += " Note: today is not an NSE trading day."
+
+    return BestSignalResponse(
+        generated_at=datetime.utcnow().isoformat(), horizon_days=1, asset_type=asset_type,
+        signals=signals, count=len(signals), note=note,
+        long_term_forecast_note=LONG_TERM_FORECAST_NOTE, disclaimer=DISCLAIMER,
+    )
+
+
 @router.post("/trade-agents/plan", response_model=TradeAgentPlanResponse)
 async def trade_agents_plan(
     req: TradeAgentRequest,
