@@ -160,6 +160,16 @@ async def _run_three_model(yf_symbol: str, ohlcv, fund: Dict[str, Any]) -> Dict[
     regime_snapshot = await get_latest_regime()
     market_regime = MarketRegime(regime_snapshot["regime"]) if regime_snapshot and regime_snapshot.get("regime") else None
 
+    # The real next NSE trading session (via the actual holiday calendar,
+    # never a naive "+1 calendar day") — this was previously hardcoded to
+    # None on this path, leaving the live analyze result with no way to
+    # tell a viewer WHICH session its 1-day forecast actually targets, only
+    # that it was "1 day" (confirmed source of real user confusion: "I am
+    # not sure about the prediction when it made for the stock").
+    from src.market.trading_calendar import next_trading_day
+    from datetime import date as _date
+    target_trading_date = await next_trading_day(_date.today())
+
     pred = await loop.run_in_executor(
         None,
         lambda: ThreeModelOrchestrator().predict(
@@ -187,7 +197,7 @@ async def _run_three_model(yf_symbol: str, ohlcv, fund: Dict[str, Any]) -> Dict[
             "risk_level": pred["risk_level"].value if pred["risk_level"] else None,
             "liquidity_level": pred["liquidity_level"].value if pred["liquidity_level"] else None,
             "market_regime": pred["market_regime"].value if pred["market_regime"] else None,
-            "target_trading_date": None,
+            "target_trading_date": target_trading_date.isoformat(),
             "model_version": pred.get("model_type"),
             "feature_version": pred.get("feature_version"),
         },
@@ -335,10 +345,15 @@ async def _analyze_equity(query: str) -> Dict[str, Any]:
             "headlines": headlines,
         },
         "prediction_horizon_note": (
+            f"This forecasts the single next trading session ({pred['three_model']['target_trading_date']}) only "
+            f"— not a multi-day trend. Computed from 5 years of price history, but that history does not extend "
+            f"the forecast itself beyond one session."
+            if pred["three_model"] and pred["three_model"].get("target_trading_date") else
             f"expected_return_pct is a {pred['return_horizon_days']}-trading-day forecast, computed from 5 years "
             "of price history — not a multi-year return forecast."
         ),
         "predicted_at": pred["predicted_at"],
+        "target_trading_date": pred["three_model"]["target_trading_date"] if pred["three_model"] else None,
         "three_model": pred["three_model"],
         "_pred": pred,  # internal, stripped before response — used by analyze_fno's FNOAnalyzer call
     }
@@ -371,6 +386,10 @@ class StockAnalysisOut(BaseModel):
     news: NewsOut
     prediction_horizon_note: str
     predicted_at: str
+    # The actual calendar date this forecast targets (via the real NSE
+    # trading calendar — never a naive "+1 day"). None on the legacy
+    # fallback path, which doesn't compute a calendar-aware target.
+    target_trading_date: Optional[str] = None
     # Populated only when the three-model system actually produced this
     # prediction (None on the legacy fallback path) — see _run_prediction.
     three_model: Optional[ThreeModelOut] = None
