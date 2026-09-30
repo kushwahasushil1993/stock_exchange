@@ -7,6 +7,7 @@ Multi-source data ingestion:
   - AMFI API               – Mutual fund NAV & returns
 """
 import asyncio
+import time
 import aiohttp
 import yfinance as yf
 import pandas as pd
@@ -37,9 +38,38 @@ class YFinanceFetcher:
         Returns DataFrame with columns:
         Open, High, Low, Close, Volume, Adj Close
         indexed by Date.
+
+        Retries a real, transient YFRateLimitError a few times with backoff
+        before giving up — this call previously had none at all, so it
+        crashed outright (uncaught by the caller) the moment Yahoo
+        rate-limited it, which is common: this is the same Yahoo endpoint
+        the (much higher-volume) universe scan hits, and the scan's own
+        AdaptiveThrottle only protects the scan's own requests, not a
+        concurrent on-demand call like this one. Confirmed live: every
+        on-demand /analyze/fno and /fno/indices/summary call failed with
+        YFRateLimitError while a full-universe scan was running.
+        Bounded to ~7s total added delay — this backs a live HTTP request a
+        user is waiting on, not a bulk background job, so it fails fast
+        enough to still be a reasonable request timeout if Yahoo stays down.
         """
+        from yfinance.exceptions import YFRateLimitError
+
         ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval, auto_adjust=True)
+        df = None
+        last_exc = None
+        for attempt, delay in enumerate((0, 2, 5), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                df = ticker.history(period=period, interval=interval, auto_adjust=True)
+                last_exc = None
+                break
+            except YFRateLimitError as exc:
+                last_exc = exc
+                logger.warning("Yahoo rate-limited fetch_ohlcv(%s), attempt %d/3: %s", symbol, attempt, exc)
+        if last_exc is not None:
+            raise last_exc
+
         if df.empty:
             logger.warning("No data returned for %s", symbol)
             return pd.DataFrame()

@@ -199,11 +199,21 @@ async def list_all_fno(
 async def indices_summary(_user: User = Depends(get_current_user)):
     """Return current Nifty50, Bank Nifty, Nifty IT levels."""
     from src.ingestion.data_fetcher import YFinanceFetcher
+    from yfinance.exceptions import YFRateLimitError
     symbols = {"NIFTY50": "^NSEI", "SENSEX": "^BSESN", "BANKNIFTY": "^NSEBANK", "NIFTYIT": "^CNXIT"}
     result = {}
     yf = YFinanceFetcher()
     for name, sym in symbols.items():
-        df = yf.fetch_ohlcv(sym, period="5d", interval="1d")
+        try:
+            df = yf.fetch_ohlcv(sym, period="5d", interval="1d")
+        except YFRateLimitError as exc:
+            # fetch_ohlcv already retried with backoff — Yahoo is still
+            # rate-limiting this specific symbol. Skip it and return the
+            # others rather than crashing the whole response over one
+            # index — confirmed live that an uncaught rate-limit exception
+            # here took down this endpoint entirely.
+            logger.warning("Yahoo rate-limited %s, omitting from indices summary: %s", sym, exc)
+            continue
         if not df.empty:
             last = df.iloc[-1]
             prev = df.iloc[-2] if len(df) > 1 else last

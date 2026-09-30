@@ -237,6 +237,7 @@ async def _run_prediction(yf_symbol: str, ohlcv, fund: Dict[str, Any], sentiment
 async def _analyze_equity(query: str) -> Dict[str, Any]:
     from src.ingestion.data_fetcher import YFinanceFetcher, NewsFetcher
     from src.sentiment.analyzer import SentimentAnalyzer
+    from yfinance.exceptions import YFRateLimitError
 
     match = await _resolve_equity(query)
     yf_symbol = match["yf_symbol"]
@@ -244,7 +245,15 @@ async def _analyze_equity(query: str) -> Dict[str, Any]:
     from src.pipelines.universe_scan import MIN_OHLCV_ROWS
 
     yf = YFinanceFetcher()
-    ohlcv = yf.fetch_ohlcv(yf_symbol, period="5y")
+    try:
+        ohlcv = yf.fetch_ohlcv(yf_symbol, period="5y")
+    except YFRateLimitError:
+        # fetch_ohlcv already retried with backoff — Yahoo is still
+        # rate-limiting. A clean, CORS-safe 503 here, not an unhandled
+        # crash: an exception raised this deep previously reached the
+        # browser with no CORS headers attached, surfacing as a bare
+        # "Network Error" instead of an explainable one.
+        raise HTTPException(status_code=503, detail="Yahoo Finance is rate-limiting requests right now — try again in a minute.")
     if ohlcv.empty:
         raise HTTPException(status_code=404, detail=f"No price data available for {yf_symbol}")
     if len(ohlcv) < MIN_OHLCV_ROWS:
