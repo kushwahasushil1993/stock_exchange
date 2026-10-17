@@ -9,7 +9,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func, or_
+from sqlalchemy import select, desc, func, or_, and_, case
 from sqlalchemy.orm import aliased
 
 from src.database.models import get_db, DecisionType, LiquidityLevel, MarketRegime, Prediction, RiskLevel, SignalType, Stock
@@ -644,6 +644,336 @@ async def get_best_signal(
         signals=signals, count=len(signals), note=note,
         long_term_forecast_note=LONG_TERM_FORECAST_NOTE, disclaimer=DISCLAIMER,
     )
+
+
+# ─── Prediction scorecard: what was predicted vs. what actually happened ─────
+# This is the per-prediction counterpart to /performance (which only ever
+# reports aggregates). §37/§68-69/§81: a prediction is only meaningful once
+# it has been checked against the session it was made for, and that check
+# has to be inspectable row by row — "the model said BHEL.NS would go UP
+# for Tuesday; Tuesday closed -0.6%, so it was wrong" — not just averaged
+# away into one accuracy number.
+#
+# Every scored field here comes from PredictionOutcome, which is written
+# once, after the fact, by src/pipelines/outcome_tracker.py. Nothing on
+# this endpoint recomputes or back-fills an outcome, so a row that hasn't
+# been evaluated yet reports AWAITING_OUTCOME rather than a guess.
+class ScorecardItemOut(BaseModel):
+    prediction_id:           int
+    symbol:                  str
+    company_name:            str
+    predicted_at:            str
+    target_trading_date:     Optional[str] = None
+    status:                  str  # RESOLVED | AWAITING_OUTCOME | NOT_EVALUABLE
+    verdict:                 str  # CORRECT | WRONG | PENDING | NOT_EVALUABLE
+
+    # ── What the model committed to, before the session happened ──
+    predicted_direction:     Optional[str] = None  # UP | DOWN | FLAT
+    decision:                Optional[str] = None
+    signal:                  Optional[str] = None
+    confidence:              Optional[float] = None
+    price_at_prediction:     Optional[float] = None
+    expected_return:         Optional[float] = None
+    expected_return_lower:   Optional[float] = None
+    expected_return_upper:   Optional[float] = None
+    target_price:            Optional[float] = None
+    stop_loss:               Optional[float] = None
+    probability_up:          Optional[float] = None
+    probability_down:        Optional[float] = None
+    probability_flat:        Optional[float] = None
+    model_version:           Optional[str] = None
+
+    # ── What the market actually did on that session ──
+    actual_open:             Optional[float] = None
+    actual_high:             Optional[float] = None
+    actual_low:              Optional[float] = None
+    actual_close:            Optional[float] = None
+    actual_return:           Optional[float] = None
+    actual_direction:        Optional[str] = None
+    evaluated_at:            Optional[str] = None
+
+    # ── The comparison ──
+    direction_correct:       Optional[bool] = None
+    return_error:            Optional[float] = None  # |expected_return - actual_return|
+    return_within_interval:  Optional[bool] = None   # did actual land inside Model B's stated interval
+    target_price_hit:        Optional[bool] = None   # did the session's range reach the target price
+    stop_loss_hit:           Optional[bool] = None   # did it reach the stop loss instead
+    explanation:             str
+
+
+class ScorecardSummaryOut(BaseModel):
+    predictions_matched:   int
+    resolved:              int
+    correct:               int
+    wrong:                 int
+    awaiting_outcome:      int
+    not_evaluable:         int
+    accuracy:              Optional[float] = None
+    mean_absolute_error:   Optional[float] = None
+    flat_threshold:        float
+    note:                  str
+
+
+class ScorecardResponse(BaseModel):
+    items:        List[ScorecardItemOut]
+    summary:      ScorecardSummaryOut
+    total:        int
+    page:         int
+    page_size:    int
+    generated_at: str
+    disclaimer:   str
+
+
+def _pct(x: Optional[float]) -> str:
+    return "—" if x is None else f"{x * 100:+.2f}%"
+
+
+def _rupees(x: Optional[float]) -> str:
+    return "—" if x is None else f"₹{x:,.2f}"
+
+
+def _scorecard_explanation(
+    symbol: str, pred: Prediction, outcome, predicted_dir: Optional[str], status: str,
+) -> str:
+    """One plain sentence a human can check, in the same shape for every row."""
+    made_on = pred.predicted_at.date().isoformat()
+    target = pred.target_trading_date.isoformat() if pred.target_trading_date else "an unrecorded session"
+    called = (
+        f"On {made_on} the model called {symbol} {predicted_dir or 'UNKNOWN'} for the {target} "
+        f"session (from {_rupees(pred.current_price)}"
+        + (f", expecting {_pct(pred.expected_return)}" if pred.expected_return is not None else "")
+        + ")"
+    )
+
+    if status == "NOT_EVALUABLE":
+        return (
+            f"{called}. This row was written without a target trading date, so there is no "
+            "session to score it against — it can never be marked right or wrong."
+        )
+    if status == "AWAITING_OUTCOME":
+        return (
+            f"{called}. That session has not been evaluated yet, so there is nothing to compare "
+            "against — the expected state until the outcome tracker runs after the close."
+        )
+
+    actual = (
+        f"It actually went {outcome.actual_direction} — closed {_rupees(outcome.actual_close)}, "
+        f"{_pct(outcome.actual_return)}"
+    )
+    if outcome.prediction_correct is True:
+        return f"{called}. {actual}. The direction call was right."
+    if outcome.prediction_correct is False:
+        return f"{called}. {actual}. The direction call was wrong."
+    return f"{called}. {actual}. No direction could be derived from this row, so it is unscored."
+
+
+@router.get("/scorecard", response_model=ScorecardResponse)
+async def get_prediction_scorecard(
+    symbol:    Optional[str] = Query(default=None, description="Filter to one stock, e.g. BHEL.NS (BHEL also matches)"),
+    status:    str = Query(default="all", pattern="^(all|resolved|pending)$"),
+    verdict:   str = Query(default="all", pattern="^(all|correct|wrong)$"),
+    days:      int = Query(default=30, ge=1, le=365, description="Only predictions made in the last N days"),
+    page:      int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    db:        AsyncSession = Depends(get_db),
+    _user:     User = Depends(get_current_user),
+):
+    """
+    Prediction-by-prediction scorecard: for each stored prediction, what the
+    model said *before* the session, what the market actually did on that
+    session, and whether the call held up.
+
+    A prediction made today targets the next trading session, so it shows up
+    as AWAITING_OUTCOME until that session closes and
+    src/pipelines/outcome_tracker.py has evaluated it (Airflow runs it daily
+    before the next scan; POST /predictions/scorecard/evaluate forces it now).
+    Nothing here fabricates an outcome for an unevaluated row.
+
+    `summary` is computed over everything the filters match, not just the
+    current page, so the accuracy number doesn't drift as you paginate.
+    """
+    from datetime import datetime, timedelta
+
+    from src.database.models import PredictionOutcome
+    from src.pipelines.outcome_tracker import FLAT_THRESHOLD, _predicted_direction
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    conds = [Prediction.predicted_at >= cutoff]
+
+    if symbol:
+        s = symbol.strip()
+        conds.append(or_(
+            Stock.symbol.ilike(s),
+            Stock.symbol.ilike(f"{s}.%"),          # "BHEL" should still find BHEL.NS
+            Stock.company_name.ilike(f"%{s}%"),
+        ))
+    if status == "resolved":
+        conds.append(PredictionOutcome.id.isnot(None))
+    elif status == "pending":
+        conds.append(PredictionOutcome.id.is_(None))
+    if verdict == "correct":
+        conds.append(PredictionOutcome.prediction_correct.is_(True))
+    elif verdict == "wrong":
+        conds.append(PredictionOutcome.prediction_correct.is_(False))
+
+    def _scoped(stmt):
+        return (
+            stmt.join(Stock, Prediction.stock_id == Stock.id)
+            .outerjoin(PredictionOutcome, PredictionOutcome.prediction_id == Prediction.id)
+            .where(and_(*conds))
+        )
+
+    # Aggregated in SQL, not in Python: a 30-day window over the full
+    # ~2,300-stock universe is ~69k rows — far too many to pull just to count.
+    matched, resolved, correct, wrong, awaiting, not_evaluable, mae = (
+        await db.execute(_scoped(select(
+            func.count(Prediction.id),
+            func.count(PredictionOutcome.id),
+            func.coalesce(func.sum(case((PredictionOutcome.prediction_correct.is_(True), 1), else_=0)), 0),
+            func.coalesce(func.sum(case((PredictionOutcome.prediction_correct.is_(False), 1), else_=0)), 0),
+            func.coalesce(func.sum(case(
+                (and_(PredictionOutcome.id.is_(None), Prediction.target_trading_date.isnot(None)), 1), else_=0,
+            )), 0),
+            func.coalesce(func.sum(case((Prediction.target_trading_date.is_(None), 1), else_=0)), 0),
+            func.avg(PredictionOutcome.prediction_error),
+        )))
+    ).one()
+
+    rows = (
+        await db.execute(
+            _scoped(select(Prediction, Stock, PredictionOutcome))
+            .order_by(desc(Prediction.predicted_at), Stock.symbol)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    items: List[ScorecardItemOut] = []
+    for pred, stock, outcome in rows:
+        predicted_dir = _predicted_direction(pred)
+
+        if outcome is not None:
+            item_status = "RESOLVED"
+            item_verdict = (
+                "CORRECT" if outcome.prediction_correct is True
+                else "WRONG" if outcome.prediction_correct is False
+                else "NOT_EVALUABLE"
+            )
+        elif pred.target_trading_date is None:
+            item_status = item_verdict = "NOT_EVALUABLE"
+        else:
+            item_status, item_verdict = "AWAITING_OUTCOME", "PENDING"
+
+        within = None
+        if (
+            outcome is not None and outcome.actual_return is not None
+            and pred.expected_return_lower is not None and pred.expected_return_upper is not None
+        ):
+            within = pred.expected_return_lower <= outcome.actual_return <= pred.expected_return_upper
+
+        # Only meaningful for a directional call: on a FLAT (or legacy,
+        # directionless) row the target/stop aren't a side the model actually
+        # took, so these stay null rather than being invented.
+        target_hit = stop_hit = None
+        if (
+            outcome is not None and predicted_dir in ("UP", "DOWN")
+            and outcome.actual_high is not None and outcome.actual_low is not None
+        ):
+            if pred.target_price is not None:
+                target_hit = (
+                    outcome.actual_high >= pred.target_price if predicted_dir == "UP"
+                    else outcome.actual_low <= pred.target_price
+                )
+            if pred.stop_loss is not None:
+                stop_hit = (
+                    outcome.actual_low <= pred.stop_loss if predicted_dir == "UP"
+                    else outcome.actual_high >= pred.stop_loss
+                )
+
+        items.append(ScorecardItemOut(
+            prediction_id=pred.id,
+            symbol=stock.symbol,
+            company_name=stock.company_name,
+            predicted_at=pred.predicted_at.isoformat(),
+            target_trading_date=pred.target_trading_date.isoformat() if pred.target_trading_date else None,
+            status=item_status,
+            verdict=item_verdict,
+            predicted_direction=predicted_dir,
+            decision=pred.decision.value if pred.decision else None,
+            signal=pred.signal.value if pred.signal else None,
+            confidence=pred.confidence,
+            price_at_prediction=pred.current_price,
+            expected_return=pred.expected_return,
+            expected_return_lower=pred.expected_return_lower,
+            expected_return_upper=pred.expected_return_upper,
+            target_price=pred.target_price,
+            stop_loss=pred.stop_loss,
+            probability_up=pred.probability_up,
+            probability_down=pred.probability_down,
+            probability_flat=pred.probability_flat,
+            model_version=pred.model_version,
+            actual_open=outcome.actual_open if outcome else None,
+            actual_high=outcome.actual_high if outcome else None,
+            actual_low=outcome.actual_low if outcome else None,
+            actual_close=outcome.actual_close if outcome else None,
+            actual_return=outcome.actual_return if outcome else None,
+            actual_direction=outcome.actual_direction if outcome else None,
+            evaluated_at=outcome.evaluated_at.isoformat() if outcome and outcome.evaluated_at else None,
+            direction_correct=outcome.prediction_correct if outcome else None,
+            return_error=outcome.prediction_error if outcome else None,
+            return_within_interval=within,
+            target_price_hit=target_hit,
+            stop_loss_hit=stop_hit,
+            explanation=_scorecard_explanation(stock.symbol, pred, outcome, predicted_dir, item_status),
+        ))
+
+    if resolved == 0:
+        note = (
+            f"{matched} prediction(s) match these filters, but none has been evaluated against a "
+            "real session yet, so there is no accuracy to report. Right after a scan that is the "
+            "correct answer, not an error — every prediction targets the NEXT trading session."
+        )
+    else:
+        note = (
+            f"{correct} of {resolved} evaluated prediction(s) called the direction correctly. "
+            f"{awaiting} more are still waiting on their target session."
+        )
+
+    return ScorecardResponse(
+        items=items,
+        summary=ScorecardSummaryOut(
+            predictions_matched=matched,
+            resolved=resolved,
+            correct=correct,
+            wrong=wrong,
+            awaiting_outcome=awaiting,
+            not_evaluable=not_evaluable,
+            accuracy=round(correct / resolved, 4) if resolved else None,
+            mean_absolute_error=round(float(mae), 5) if mae is not None else None,
+            flat_threshold=FLAT_THRESHOLD,
+            note=note,
+        ),
+        total=matched,
+        page=page,
+        page_size=page_size,
+        generated_at=datetime.utcnow().isoformat(),
+        disclaimer=DISCLAIMER,
+    )
+
+
+@router.post("/scorecard/evaluate")
+async def evaluate_pending_predictions(_user: User = Depends(get_current_user)):
+    """
+    Score every prediction whose target trading session has already passed and
+    whose price data is already in the database.
+
+    Airflow runs this exact step daily (dags/pipeline_dags.py → track_outcomes),
+    so this endpoint exists only to force it now — e.g. a local run with no
+    scheduler. It is idempotent: a PredictionOutcome row is inserted once and
+    never rewritten (§38), so a second call evaluates nothing.
+    """
+    from src.pipelines.outcome_tracker import track_outcomes
+    return await track_outcomes()
 
 
 @router.post("/trade-agents/plan", response_model=TradeAgentPlanResponse)
