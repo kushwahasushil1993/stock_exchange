@@ -7,6 +7,7 @@ Multi-source data ingestion:
   - AMFI API               – Mutual fund NAV & returns
 """
 import asyncio
+import time
 import aiohttp
 import yfinance as yf
 import pandas as pd
@@ -37,9 +38,38 @@ class YFinanceFetcher:
         Returns DataFrame with columns:
         Open, High, Low, Close, Volume, Adj Close
         indexed by Date.
+
+        Retries a real, transient YFRateLimitError a few times with backoff
+        before giving up — this call previously had none at all, so it
+        crashed outright (uncaught by the caller) the moment Yahoo
+        rate-limited it, which is common: this is the same Yahoo endpoint
+        the (much higher-volume) universe scan hits, and the scan's own
+        AdaptiveThrottle only protects the scan's own requests, not a
+        concurrent on-demand call like this one. Confirmed live: every
+        on-demand /analyze/fno and /fno/indices/summary call failed with
+        YFRateLimitError while a full-universe scan was running.
+        Bounded to ~7s total added delay — this backs a live HTTP request a
+        user is waiting on, not a bulk background job, so it fails fast
+        enough to still be a reasonable request timeout if Yahoo stays down.
         """
+        from yfinance.exceptions import YFRateLimitError
+
         ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval, auto_adjust=True)
+        df = None
+        last_exc = None
+        for attempt, delay in enumerate((0, 2, 5), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                df = ticker.history(period=period, interval=interval, auto_adjust=True)
+                last_exc = None
+                break
+            except YFRateLimitError as exc:
+                last_exc = exc
+                logger.warning("Yahoo rate-limited fetch_ohlcv(%s), attempt %d/3: %s", symbol, attempt, exc)
+        if last_exc is not None:
+            raise last_exc
+
         if df.empty:
             logger.warning("No data returned for %s", symbol)
             return pd.DataFrame()
@@ -117,6 +147,35 @@ class YFinanceFetcher:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Index F&O — NIFTY/BANKNIFTY/etc. are the single most-traded F&O
+# instruments in India, but NSEUniverseFetcher.fetch_fno_symbols() excludes
+# them (they're derivatives, not equities — no "Stock" the way a company
+# is). Kept as a small separate registry rather than folded into the
+# equity/F&O symbol lists, since each entry needs its own yfinance ticker
+# (indices aren't ".NS"-suffixable the way stocks are) and has no
+# fundamentals (no PE ratio, no sector). Every ticker below was verified
+# directly against yfinance's own metadata (Ticker(...).info["longName"]),
+# not guessed from the symbol string.
+INDEX_FNO = {
+    "NIFTY":      {"yf_symbol": "^NSEI",        "company_name": "Nifty 50"},
+    "BANKNIFTY":  {"yf_symbol": "^NSEBANK",      "company_name": "Nifty Bank"},
+    "FINNIFTY":   {"yf_symbol": "NIFTY_FIN_SERVICE.NS", "company_name": "Nifty Financial Services"},
+    "MIDCPNIFTY": {"yf_symbol": "^NSEMDCP50",    "company_name": "Nifty Midcap 50"},
+    "NIFTYNXT50": {"yf_symbol": "^NSMIDCP",      "company_name": "Nifty Next 50"},
+    # BSE's benchmark index (not NSE/F&O-traded like the rest of this
+    # registry, but tracked the same way for market-direction context —
+    # ticker verified directly against yfinance's own .info["longName"]
+    # ("S&P BSE SENSEX"), same rigor as every other entry here).
+    "SENSEX":     {"yf_symbol": "^BSESN",        "company_name": "S&P BSE Sensex"},
+}
+# FINNIFTY (NIFTY_FIN_SERVICE.NS) has a live price on Yahoo but only ~1 day
+# of historical OHLCV — genuinely insufficient for the technical-indicator
+# pipeline (MIN_OHLCV_ROWS), not a fetch bug. It's included anyway and will
+# naturally fall into the same "insufficient_data" skip path every other
+# thinly-covered symbol already does, rather than special-cased out.
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # NSE Universe Fetcher — full listed-equity / F&O-eligible symbol lists
 # ════════════════════════════════════════════════════════════════════════════
 class NSEUniverseFetcher:
@@ -136,10 +195,20 @@ class NSEUniverseFetcher:
     # Index derivatives that appear in fo_mktlots.csv alongside single-stock ones
     INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "NIFTYFPI"}
 
+    # SERIES values worth scanning. EQ = normal main-board trading (the vast
+    # majority). BE/BZ = "trade-to-trade" — NSE settlement categories for
+    # stocks under surveillance for volatility/illiquidity/compliance flags;
+    # still real, live NSE-listed equities with their own price history, just
+    # thinner and more volatile trading. Every other series (debt
+    # instruments, rights entitlements, SDLs, etc.) is excluded — those
+    # aren't equities at all, not a coverage gap.
+    EQUITY_SERIES = {"EQ", "BE", "BZ"}
+
     async def fetch_equity_symbols(self) -> List[Dict[str, str]]:
         """
-        All NSE main-board (SERIES == EQ) listed equities.
-        Returns [{"symbol": "RELIANCE", "yf_symbol": "RELIANCE.NS", "company_name": "..."}]
+        All NSE-listed equities in EQUITY_SERIES (EQ + BE + BZ — see that
+        set's comment for what each means and why).
+        Returns [{"symbol": "RELIANCE", "yf_symbol": "RELIANCE.NS", "company_name": "...", "series": "EQ"}]
         """
         import csv
         import io
@@ -152,7 +221,8 @@ class NSEUniverseFetcher:
         result = []
         for row in reader:
             row = {k.strip(): (v.strip() if v else v) for k, v in row.items()}
-            if row.get("SERIES") != "EQ":
+            series = row.get("SERIES")
+            if series not in self.EQUITY_SERIES:
                 continue
             symbol = row.get("SYMBOL", "")
             if not symbol:
@@ -161,6 +231,7 @@ class NSEUniverseFetcher:
                 "symbol": symbol,
                 "yf_symbol": f"{symbol}.NS",
                 "company_name": row.get("NAME OF COMPANY", symbol),
+                "series": series,
             })
         return result
 
@@ -208,6 +279,11 @@ class NSEFetcher:
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.nseindia.com/",
     }
+    # None of these calls had an explicit timeout — a stale/bot-detected
+    # cookie can make NSE's server hold the connection open without ever
+    # responding, rather than rejecting quickly, so this was an unbounded
+    # hang (aiohttp's own default is 300s) instead of a clean failure.
+    TIMEOUT = aiohttp.ClientTimeout(total=12)
 
     async def _get_session_cookie(self, session: aiohttp.ClientSession) -> str:
         """
@@ -221,7 +297,7 @@ class NSEFetcher:
         """
         if settings.nse_cookie:
             return settings.nse_cookie
-        async with session.get(self.BASE_URL, headers=self.HEADERS) as resp:
+        async with session.get(self.BASE_URL, headers=self.HEADERS, timeout=self.TIMEOUT) as resp:
             cookies = {k: v.value for k, v in resp.cookies.items()}
             return "; ".join([f"{k}={v}" for k, v in cookies.items()])
 
@@ -230,7 +306,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}
@@ -241,7 +317,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}
@@ -251,7 +327,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}
@@ -261,7 +337,7 @@ class NSEFetcher:
         async with aiohttp.ClientSession() as session:
             cookie = await self._get_session_cookie(session)
             headers = {**self.HEADERS, "Cookie": cookie}
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=self.TIMEOUT) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return {}
@@ -285,6 +361,7 @@ class NewsFetcher:
         query: str = "Indian stock market NSE BSE Nifty",
         days_back: int = 3,
         page_size: int = 100,
+        sort_by: str = "relevancy",
     ) -> List[Dict[str, Any]]:
         if not self.api_key:
             logger.warning("NewsAPI key not set, skipping NewsAPI fetch")
@@ -294,7 +371,16 @@ class NewsFetcher:
         params = {
             "q": query,
             "from": from_date,
-            "sortBy": "publishedAt",
+            # "publishedAt" (the old default) ranks purely by recency,
+            # regardless of how well an article actually matches `query` —
+            # confirmed pulling in completely unrelated articles (a Baozun
+            # share buyback, a Rocket Lab acquisition) for a Reliance
+            # Industries query, just because they were recent and loosely
+            # matched a generic word like "share". Relevancy sort plus the
+            # exact-phrase query callers now build (see analyze.py) fixes
+            # this at the source; _filter_relevant_articles below is a
+            # second, independent check on top.
+            "sortBy": sort_by,
             "language": "en",
             "pageSize": page_size,
             "apiKey": self.api_key,

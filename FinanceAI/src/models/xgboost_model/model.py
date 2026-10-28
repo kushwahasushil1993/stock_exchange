@@ -106,6 +106,70 @@ class XGBoostModel:
             logger.error("XGB training failed: %s", exc)
             return {"error": str(exc)}
 
+    def train_fast(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        symbol: str,
+        n_estimators: int = 300,
+    ) -> Dict:
+        """
+        Single fit with sensible fixed hyperparameters — no Optuna search, no
+        cross-validation. train_with_hpo's 15-trial x 5(or 3)-fold search
+        means 45-75 separate XGBoost fits; on a large pooled cross-sectional
+        dataset (hundreds of thousands of rows, from src/pipelines/
+        train_global_model.py) each fit is slow enough that the full search
+        can run for the better part of an hour without finishing. This is
+        the practical choice for that dataset size — one well-configured fit
+        instead of dozens of exploratory ones for marginal tuning gains.
+        """
+        try:
+            import xgboost as xgb
+            from sklearn.model_selection import train_test_split
+
+            self.feature_names = list(X.columns)
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X, y, test_size=0.2, stratify=y, random_state=42
+            )
+
+            params = {
+                "n_estimators":      n_estimators,
+                "max_depth":         5,
+                "learning_rate":     0.05,
+                "subsample":         0.8,
+                "colsample_bytree":  0.8,
+                "min_child_weight":  3,
+                "reg_alpha":         0.1,
+                "reg_lambda":        1.0,
+                "scale_pos_weight":  (y_tr == 0).sum() / max((y_tr == 1).sum(), 1),
+                "eval_metric":       "auc",
+                "random_state":      42,
+                "tree_method":       "hist",
+                "n_jobs":            -1,
+            }
+            self.model = xgb.XGBClassifier(**params)
+            self.model.fit(X_tr, y_tr)
+
+            proba = self.model.predict_proba(X_val)[:, 1]
+            preds = (proba >= 0.5).astype(int)
+            metrics = {
+                "val_auc":      round(roc_auc_score(y_val, proba), 4),
+                "val_accuracy": round(accuracy_score(y_val, preds), 4),
+                "val_f1":       round(f1_score(y_val, preds, zero_division=0), 4),
+                "params":       params,
+            }
+
+            artifact_path = str(self.model_dir / f"{symbol}_xgb.pkl")
+            with open(artifact_path, "wb") as f:
+                pickle.dump({"model": self.model, "features": self.feature_names}, f)
+
+            logger.info("XGB model saved (fast fit): %s | metrics=%s", artifact_path, metrics)
+            return {"artifact_path": artifact_path, "metrics": metrics}
+
+        except Exception as exc:
+            logger.error("XGB fast training failed: %s", exc)
+            return {"error": str(exc)}
+
     def get_shap_importance(self, X: pd.DataFrame) -> Dict[str, float]:
         """Compute SHAP feature importance values."""
         try:

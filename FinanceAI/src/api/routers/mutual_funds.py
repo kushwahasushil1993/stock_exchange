@@ -1,11 +1,13 @@
 """Mutual Funds router — top MF recommendations by risk profile."""
 import asyncio
+import logging
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from src.api.routers.auth import get_current_user, User
 from src.recommendation.engine import MFRecommendation, MutualFundRecommender, RiskProfile
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -19,7 +21,23 @@ async def get_top_mutual_funds(
     consolidated /top-buys endpoint. This is a live snapshot (AMFI has no
     dated "prediction" history to filter by, unlike stocks/F&O), so it takes
     no date range.
+
+    This does up to 200 concurrent per-scheme historical-NAV network calls
+    (mfapi.in) — measured at 40-50s uncached. /predictions/top-picks already
+    caches in Redis for this exact reason; this had no caching at all, which
+    is why /top-buys (calls this for its mutual_funds section) was the slow
+    part of every Dashboard load despite the rest of the page being fast.
     """
+    import dataclasses
+    import json
+
+    from src.database.models import redis_cache
+
+    cache_key = f"mf_recommendations:{risk_profile}:{top_n}:{category or ''}"
+    cached = await redis_cache.get(cache_key)
+    if cached:
+        return [MFRecommendation(**item) for item in json.loads(cached)]
+
     from src.ingestion.data_fetcher import AMFIFetcher
     import pandas as pd
 
@@ -49,9 +67,23 @@ async def get_top_mutual_funds(
     sem = asyncio.Semaphore(20)
 
     async def _fetch_with_returns(row):
-        async with sem:
-            hist = await fetcher.fetch_historical_nav(str(row["scheme_code"]))
-        return {**row.to_dict(), **fetcher.compute_returns(hist)}
+        try:
+            async with sem:
+                hist = await fetcher.fetch_historical_nav(str(row["scheme_code"]))
+            return {**row.to_dict(), **fetcher.compute_returns(hist)}
+        except Exception as exc:
+            # mfapi.in is occasionally slow/flaky per-scheme — one timeout
+            # shouldn't take down the whole batch (asyncio.gather's default
+            # behavior on an unhandled exception: cancel every other
+            # in-flight task and raise, turning 199 good results into a 500).
+            # str(exc) is empty for a bare asyncio.TimeoutError (the common
+            # case here) — include the exception type or the message is a
+            # useless "failed for 100470: " with nothing after the colon.
+            logger.warning(
+                "Historical NAV fetch failed for %s: %s: %s",
+                row.get("scheme_code"), type(exc).__name__, exc or "(no message)",
+            )
+            return {**row.to_dict()}  # no return_1y/3y/5y -> scores 0 on those, not excluded
 
     enriched_rows = await asyncio.gather(*(
         _fetch_with_returns(row) for _, row in open_ended.iterrows()
@@ -66,12 +98,16 @@ async def get_top_mutual_funds(
     enriched_df["expense_ratio"] = None
     enriched_df["aum"]           = None
 
-    return MutualFundRecommender().recommend(
+    recs = MutualFundRecommender().recommend(
         enriched_df,
         risk_profile    = RiskProfile(risk_profile),
         top_n           = top_n,
         category_filter = category,
     )
+    await redis_cache.set(
+        cache_key, json.dumps([dataclasses.asdict(r) for r in recs]), ttl=1800,
+    )
+    return recs
 
 
 class MFOut(BaseModel):

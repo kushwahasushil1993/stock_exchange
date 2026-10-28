@@ -29,6 +29,15 @@ class APIKeys(BaseSettings):
     razorpay_key_secret: str = Field(default="")
     razorpay_webhook_secret: str = Field(default="")
 
+    # Meta WhatsApp Cloud API (https://developers.facebook.com/docs/whatsapp/cloud-api)
+    # — see src/notifications/whatsapp.py for what each of these needs to be.
+    whatsapp_access_token: str = Field(default="")
+    whatsapp_phone_number_id: str = Field(default="")
+    whatsapp_template_name: str = Field(default="daily_stock_predictions")
+    whatsapp_template_lang: str = Field(default="en_US")
+    # E.164 format, comma-separated, e.g. "+919876543210,+919812345678"
+    whatsapp_recipient_numbers: str = Field(default="")
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

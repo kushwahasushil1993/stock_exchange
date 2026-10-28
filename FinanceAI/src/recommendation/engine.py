@@ -502,6 +502,8 @@ class MutualFundRecommender:
           return_1y, return_3y, return_5y, sharpe_ratio, sortino_ratio,
           alpha, expense_ratio, aum.
         """
+        if mf_df.empty:
+            return []
         df = mf_df.copy()
 
         # Filter by risk profile

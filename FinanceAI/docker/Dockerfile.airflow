@@ -1,0 +1,39 @@
+# Airflow's DAGs (dags/pipeline_dags.py) call into this project's own src/
+# package (universe_scan, the prediction ensemble, the WhatsApp notifier,
+# ...) — none of which are installed in the stock apache/airflow image.
+# Confirmed broken before this fix: `ModuleNotFoundError: No module named
+# 'xgboost'` on any DAG run — the DAGs had been paused the whole time this
+# went unnoticed.
+#
+# Installing requirements.txt straight into Airflow's own site-packages
+# doesn't work: Airflow 2.10's bundled environment pins sqlalchemy==1.4.x
+# and pydantic==2.8.2, while this project's code uses SQLAlchemy 2.0's
+# async ORM API (Mapped/mapped_column/async_sessionmaker — none of which
+# exist in 1.4) and pydantic==2.7.1 — genuinely incompatible, not just a
+# version-string mismatch (confirmed via a direct `pip install -r
+# requirements.txt --constraint <airflow's own constraints file>`, which
+# pip itself refused as unresolvable on the pydantic pin alone).
+#
+# So: a separate venv, matching what requirements-airflow.txt's own comment
+# already prescribed ("must be installed in its own virtualenv") but the
+# actual Dockerfile never did. DAG task callables in pipeline_dags.py run
+# their src/* work as a subprocess against THIS venv's python, never via a
+# direct `import` into Airflow's own interpreter — so the two dependency
+# graphs never collide.
+FROM apache/airflow:2.10.0
+
+USER root
+RUN python3.12 -m venv /opt/finai-venv
+COPY requirements.txt /requirements.txt
+RUN /opt/finai-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/finai-venv/bin/pip install --no-cache-dir -r /requirements.txt \
+    && chown -R airflow:root /opt/finai-venv
+
+# /app/{src,config,scripts,models_store} get overlaid by docker-compose.yml's
+# bind mounts at runtime — only /app/data and /app/logs (scripts/
+# airflow_tasks.py's ingest_ohlcv/ingest_news write here) need to actually
+# exist with the right owner ahead of time.
+RUN mkdir -p /app/data/raw /app/data/processed /app/logs \
+    && chown -R airflow:root /app
+
+USER airflow

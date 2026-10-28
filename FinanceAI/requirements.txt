@@ -55,3 +55,9 @@ tenacity==8.3.0            # Retry logic
 loguru==0.7.2
 pyarrow==16.1.0            # Parquet I/O
 razorpay==2.0.1           # UPI and card payment gateway (2.x drops pkg_resources)
+
+# ─── Testing ──────────────────────────────────────────────────────────────────
+# Was never actually a declared dependency despite tests/ existing — those
+# tests could not have run in this environment, ever, until now.
+pytest==8.3.2
+pytest-asyncio==0.24.0

@@ -130,7 +130,7 @@ class TestTechnicalFeatures:
         tf = TechnicalFeatures()
         fp = FeaturePipeline()
         enriched = tf.compute(sample_ohlcv)
-        X, y, scaler, feats = fp.prepare_xgboost_input(enriched)
+        X, y, scaler, feats, fwd_return = fp.prepare_xgboost_input(enriched)
         assert X.shape[0] == len(y)
         assert X.shape[1] > 0
 

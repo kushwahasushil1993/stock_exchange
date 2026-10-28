@@ -9,7 +9,7 @@ Feature Engineering Pipeline:
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,17 @@ class TechnicalFeatures:
             df[f"ema_{w}"] = close.ewm(span=w, adjust=False).mean()
 
         df["sma_20_slope"]  = df["sma_20"].diff(5) / 5
+        df["sma_50_slope"]  = df["sma_50"].diff(5) / 5
+        df["sma_200_slope"] = df["sma_200"].diff(5) / 5
         df["price_vs_sma50"]= (close - df["sma_50"]) / df["sma_50"]
+        df["price_vs_ema20"]= (close - df["ema_20"]) / df["ema_20"]
+        df["price_vs_sma200"]=(close - df["sma_200"]) / df["sma_200"]
         df["golden_cross"]  = (df["sma_50"] > df["sma_200"]).astype(int)
+
+        # ── Swing structure (backward-looking only — see _swing_structure) ──
+        swing = self._swing_structure(high, low, close)
+        for col in swing.columns:
+            df[col] = swing[col]
 
         # MACD
         ema12 = close.ewm(span=12, adjust=False).mean()
@@ -54,6 +63,7 @@ class TechnicalFeatures:
             (df["macd"] > df["macd_signal"]) &
             (df["macd"].shift(1) <= df["macd_signal"].shift(1))
         ).astype(int)
+        df["macd_histogram_slope"] = df["macd_hist"].diff(5) / 5
 
         # Parabolic SAR (simplified)
         df["psar"] = self._parabolic_sar(high, low, close)
@@ -62,6 +72,8 @@ class TechnicalFeatures:
         # RSI
         for period in [9, 14, 21]:
             df[f"rsi_{period}"] = self._rsi(close, period)
+        df["rsi_slope"] = df["rsi_14"].diff(5) / 5
+        df["rsi_divergence"] = self._rsi_divergence(close, df["rsi_14"])
 
         # Stochastic %K %D
         df["stoch_k"], df["stoch_d"] = self._stochastic(high, low, close)
@@ -127,6 +139,19 @@ class TechnicalFeatures:
 
         # Trend strength
         df["adx"] = self._adx(high, low, close, 14)
+
+        # ── Support / resistance distance ───────────────────────────────────
+        # Rolling 20-bar high/low as a support/resistance proxy — both are
+        # backward-looking only (pandas .rolling(20) at row i uses rows
+        # [i-19, i], never i+1 onward), so this is safe to use as a
+        # same-day feature for a next-session target.
+        resistance = high.rolling(20).max()
+        support = low.rolling(20).min()
+        df["resistance_distance"] = (resistance - close) / close
+        df["support_distance"] = (close - support) / close
+
+        # ── Volume trend ─────────────────────────────────────────────────────
+        df["volume_trend"] = df["vol_sma_20"].pct_change(10)
 
         return df.replace([np.inf, -np.inf], np.nan)
 
@@ -211,6 +236,49 @@ class TechnicalFeatures:
         return mfv.rolling(period).sum() / vol.rolling(period).sum()
 
     @staticmethod
+    def _swing_structure(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 10) -> pd.DataFrame:
+        """
+        higher_highs / higher_lows / lower_highs / lower_lows — whether this
+        window's price extreme exceeds the PRIOR (non-overlapping) window's
+        extreme. This is a backward-looking proxy for swing structure, not a
+        literal fractal/pivot detector: a real pivot-point detector needs N
+        bars AFTER a candidate point to confirm it's a local extreme, which
+        would only be knowable in hindsight — using it as a same-day feature
+        for a next-session target would be look-ahead leakage. Comparing two
+        adjacent backward-only rolling windows avoids that at the cost of
+        being a cruder signal.
+        """
+        roll_high = high.rolling(window).max()
+        roll_low = low.rolling(window).min()
+        prev_high = roll_high.shift(window)
+        prev_low = roll_low.shift(window)
+        return pd.DataFrame({
+            "higher_highs": (roll_high > prev_high).astype(int),
+            "lower_highs": (roll_high < prev_high).astype(int),
+            "higher_lows": (roll_low > prev_low).astype(int),
+            "lower_lows": (roll_low < prev_low).astype(int),
+        }, index=high.index)
+
+    @staticmethod
+    def _rsi_divergence(close: pd.Series, rsi: pd.Series, window: int = 10) -> pd.Series:
+        """
+        +1 = bullish divergence proxy (price making a lower low over this
+        window than the prior window, while RSI is making a higher low —
+        weakening downward momentum), -1 = bearish divergence proxy (price
+        higher high, RSI lower high), 0 = neither. Same backward-only,
+        adjacent-rolling-window comparison as _swing_structure, for the same
+        leakage-safety reason — not a strict pivot-to-pivot divergence
+        detector.
+        """
+        price_hh = close.rolling(window).max() > close.rolling(window).max().shift(window)
+        price_ll = close.rolling(window).min() < close.rolling(window).min().shift(window)
+        rsi_lh = rsi.rolling(window).max() < rsi.rolling(window).max().shift(window)
+        rsi_hl = rsi.rolling(window).min() > rsi.rolling(window).min().shift(window)
+        bearish = price_hh & rsi_lh
+        bullish = price_ll & rsi_hl
+        return bullish.astype(int) - bearish.astype(int)
+
+    @staticmethod
     def _adx(
         high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
     ) -> pd.Series:
@@ -291,10 +359,30 @@ class FeaturePipeline:
 
     XGBOOST_FEATURES = LSTM_FEATURES + [
         "roc_5", "roc_10", "roc_20",
-        "williams_r", "stoch_k",
+        # stoch_k is NOT re-listed here — it's already inherited from
+        # LSTM_FEATURES above. Re-adding it used to produce two identically-
+        # named "stoch_k" columns in the feature matrix, which both XGBoost
+        # and LightGBM reject outright ("feature_names must be unique") —
+        # meaning every attempt to actually train either model on this
+        # feature set failed immediately, unconditionally, for every symbol.
+        "williams_r",
         "gap_up", "gap_down",
         "candle_body", "upper_shadow", "lower_shadow",
         "golden_cross", "macd_crossover",
+        # New technical features — swing structure, S/R distance, MA slopes,
+        # RSI slope/divergence, MACD histogram slope, volume trend (all
+        # backward-looking only — see TechnicalFeatures._swing_structure /
+        # _rsi_divergence docstrings for the leakage-safety reasoning).
+        "sma_50_slope", "sma_200_slope", "price_vs_ema20", "price_vs_sma200",
+        "higher_highs", "lower_highs", "higher_lows", "lower_lows",
+        "resistance_distance", "support_distance",
+        "rsi_slope", "rsi_divergence", "macd_histogram_slope", "volume_trend",
+        # Sector context (src/market/sector_index.py) — real NSE sectoral
+        # index vs. this stock's own return, joined in by universe_scan.py/
+        # train_three_models.py before this pipeline runs. NaN (not 0) for
+        # a stock whose sector has no real index mapping (e.g. Utilities) —
+        # tree models handle NaN as a legitimate "missing" split natively.
+        "sector_return", "return_vs_sector", "rolling_beta_sector", "rolling_corr_sector",
         # Fundamental features added later
         "pe_ratio", "pb_ratio", "roe", "debt_to_equity",
         "revenue_growth_yoy", "profit_margin", "beta",
@@ -339,37 +427,102 @@ class FeaturePipeline:
         sentiment: Optional[float] = None,
         macro: Optional[Dict] = None,
         horizon: int = 5,
+        direction_classes: int = 2,
+        flat_threshold: float = 0.002,
+        return_threshold: float = 0.02,
     ) -> tuple:
         """
-        Prepare tabular features for XGBoost/LightGBM.
-        Target = 1 if 5-day forward return > 2%, 0 otherwise.
-        """
-        from sklearn.preprocessing import StandardScaler
+        Prepare tabular features for XGBoost/LightGBM, plus BOTH a
+        classification target and the continuous forward return in one
+        pass (so a direction model and a return-regression model can be
+        trained from a single feature computation instead of duplicating
+        it) — see Model A/Model B in src/models/direction_model.py and
+        src/models/return_model.py.
 
+        direction_classes=2 (default, backward-compatible with existing
+        callers): target = 1 if forward return > return_threshold, else 0.
+        direction_classes=3: target = 2 (UP) if forward return >
+        flat_threshold, 0 (DOWN) if < -flat_threshold, else 1 (FLAT) — a
+        small dead-zone around zero so noise-level moves aren't forced into
+        a direction, matching "estimate probabilities... not force a
+        prediction."
+
+        Returns (X, y, scaler, features, fwd_return) — fwd_return is the
+        raw, unthresholded forward return for the SAME rows as X/y, for
+        regression training.
+        """
         data = df.copy()
 
-        # Inject scalar features
-        if fundamental:
-            for k, v in fundamental.items():
-                if k in self.XGBOOST_FEATURES:
-                    data[k] = v
-        if sentiment is not None:
-            data["sentiment_score"] = sentiment
-        if macro:
-            for k, v in macro.items():
-                data[k] = v
-
-        # Forward return target
+        # Target first, dropna on technical + target ONLY, before injecting
+        # the scalar fundamental/macro columns below. Those scalars broadcast
+        # one value across every historical row for this symbol — if any
+        # single one is missing (common: Yahoo has no "beta" for plenty of
+        # small/mid-caps) and dropna() ran across the combined frame, that
+        # one all-NaN column would silently wipe out EVERY row for the whole
+        # symbol, collapsing X to 0 rows. That used to happen invisibly:
+        # callers just saw an empty X, treated it as "no data", and fell
+        # through to the neutral 0.5 placeholder — for any symbol missing
+        # even one fundamental field, not just ones truly short on history.
         data["fwd_return"] = data["Close"].pct_change(horizon).shift(-horizon)
-        data["target"] = (data["fwd_return"] > 0.02).astype(int)
+        if direction_classes == 3:
+            data["target"] = np.select(
+                [data["fwd_return"] > flat_threshold, data["fwd_return"] < -flat_threshold],
+                [2, 0],  # 2=UP, 0=DOWN
+                default=1,  # 1=FLAT
+            )
+        else:
+            data["target"] = (data["fwd_return"] > return_threshold).astype(int)
+        tech_features = [f for f in self.XGBOOST_FEATURES if f in data.columns]
+        data = data[tech_features + ["target", "fwd_return"]].dropna()
+
+        # Inject scalar features — always as a properly-typed float column,
+        # for every field XGBOOST_FEATURES expects, even when this symbol
+        # has no value for it (np.nan, not left absent, and not the bare
+        # Python `None`: `data[k] = None` makes pandas infer an object-dtype
+        # column, which LightGBM rejects outright — "pandas dtypes must be
+        # int, float or bool" — and skipping the column entirely would shift
+        # every later feature out of position for XGBoost's positional
+        # (.values) inference path). Emitting the same full column set on
+        # every call, training and inference alike, keeps every row's
+        # feature alignment identical regardless of which scalar values
+        # happen to be available for a given symbol. XGBoost/LightGBM's
+        # hist-based tree building treats NaN as a legitimate "missing"
+        # split value natively, so no imputation is needed either.
+        scalar_sources: Dict[str, Any] = {}
+        if fundamental:
+            scalar_sources.update(fundamental)
+        if sentiment is not None:
+            scalar_sources["sentiment_score"] = sentiment
+        if macro:
+            scalar_sources.update(macro)
+
+        SCALAR_FEATURES = [
+            "pe_ratio", "pb_ratio", "roe", "debt_to_equity",
+            "revenue_growth_yoy", "profit_margin", "beta",
+            "sentiment_score",
+            "usd_inr_ret", "gold_ret", "crude_ret", "vix",
+        ]
+        for k in SCALAR_FEATURES:
+            if k not in self.XGBOOST_FEATURES or k in data.columns:
+                continue
+            v = scalar_sources.get(k)
+            try:
+                data[k] = float(v) if v is not None else np.nan
+            except (TypeError, ValueError):
+                data[k] = np.nan
 
         features = [f for f in self.XGBOOST_FEATURES if f in data.columns]
-        data = data[features + ["target"]].dropna()
-
         X = data[features]
         y = data["target"]
+        fwd_return = data["fwd_return"]
 
-        scaler = StandardScaler()
-        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=features, index=X.index)
+        # Tree models don't need feature scaling (invariant to any monotonic
+        # per-feature transform) — returning raw X keeps train and inference
+        # using the exact same untransformed values, and avoids re-fitting a
+        # StandardScaler on whatever single row is being scored at inference
+        # time (which the old code did, and which especially breaks for a
+        # single-row inference call since a 1-row fit has zero variance).
+        scaler = None
+        X_scaled = X
 
-        return X_scaled, y, scaler, features
+        return X_scaled, y, scaler, features, fwd_return
